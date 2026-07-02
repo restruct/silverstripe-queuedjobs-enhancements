@@ -1,0 +1,9 @@
+---
+Name: queuedjobs-enhancements-routes
+After:
+  - '#rootroutes'
+  - '#coreroutes'
+---
+SilverStripe\Control\Director:
+  rules:
+    'api/job-progress//$ID': 'Restruct\QueuedJobsEnhancements\Controllers\JobProgressController'

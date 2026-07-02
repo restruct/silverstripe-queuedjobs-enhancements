@@ -1,0 +1,15 @@
+---
+Name: queuedjobs-enhancements
+After:
+  - '#queuedjobsettings'
+---
+# ImmediateJobRunner: set true if inotifywait is running (uses IMMEDIATE queue instead of CLI spawn)
+Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
+  use_immediate_queue: false
+
+# Self-declaring default jobs: Extension on QueuedJobsAdmin ensures
+# jobs with $is_default_job = true are in the queue when admin visits.
+# For cron: add `sake dev/tasks/check-default-jobs` to crontab.
+Symbiote\QueuedJobs\Controllers\QueuedJobsAdmin:
+  extensions:
+    - Restruct\QueuedJobsEnhancements\Extensions\DefaultJobServiceExtension
