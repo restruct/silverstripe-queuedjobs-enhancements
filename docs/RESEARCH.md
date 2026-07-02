@@ -2,12 +2,29 @@
 
 This document distills the design thinking behind `restruct/silverstripe-queuedjobs-enhancements` so the module's backup is self-contained. It records **why** each delivered component exists, the alternatives that were considered and rejected, and the SS5→SS6 migration notes. For the roadmap (done vs. planned) see [../PLAN.md](../PLAN.md); for usage see [../README.md](../README.md).
 
-## Origin documents
+## Sources
 
-Two machine-local documents drove this work. They are referenced here for anyone with access; **this module does not depend on either** — everything needed is captured below.
+The design was driven by these local documents. **This module does not depend on any of them** — everything needed is captured in this file, `README.md` and `PLAN.md`. Verified inventory (2026-07-02):
 
-1. **The research/evaluation** — Restruct SSKB, `silverstripe/ideas/queuedjobs-enhancements.md`. The full ~1400-line evaluation: problem statement, six proposed "pillars", prior-art survey, and a Laravel-feature comparison. This module implements Pillars 1, 2 and 5.
-2. **The site-integration status brief** — `<site>/docs/queuedjobs-enhancements-module-status.md`. How the module was wired into a site (a `_dev/` path repository), the crash-recovery fixes, and the `_dev` vs project-root manifest gotcha (see below).
+**Primary research (Restruct SSKB)**
+- `silverstripe/ideas/queuedjobs-enhancements.md` (~64 KB) — the research doc: problem statement, six proposed "pillars", prior-art survey, a Laravel-feature comparison, and full code sketches + the phased scope (Phases 1/2/5) the module was built from.
+- `silverstripe/topics/queuedjobs.md` (~63 KB) — the SSKB QueuedJobs reference (job lifecycle, config, patterns; the `ss-queuedjobs` agent knowledge base). Source for the shutdown-function / IMMEDIATE-queue analysis in this doc.
+
+**Plans**
+- `PLAN.md` (this repo) — the canonical, evolved plan actually followed (adds `_config/config.yml`, the CLI-spawn `ImmediateJobRunner`).
+- `~/.claude/plans/flickering-finding-sedgewick.md` — an earlier draft (used `fastcgi_finish_request()`, module at project root). **Since deleted**; fully superseded by `PLAN.md`.
+
+**SSKB profiles that governed the workflow**
+- `silverstripe/profiles/local-module-dev.md` — the `_dev/` path-repository workflow (the fix for the double-scan bug below).
+- `silverstripe/profiles/composer.md` — path repos + version constraints (`dev-ss5-update`).
+- `silverstripe/profiles/cli-commands.md` — when to flush vs. dev/build; `cli-script.php` over `sake` (cited in `ImmediateJobRunner`).
+
+**Consolidation origins (code moved into this module)**
+- `restruct/silverstripe-admintweaks: src/Jobs/ScheduledMethodCall.php` — origin of this module's `ScheduledMethodCall` (present in the working admintweaks copy).
+- `restruct/silverstripe-admintweaks: src/Dev/CleanupBrokenJobsTask.php` — origin of `CleanupBrokenJobsTask`. **Gap:** not present in the working admintweaks copy consulted (its `Dev/` only had `FocusPointInvertYaxisTask.php`), likely a different admintweaks version/branch. To diff the consolidated task against its source, locate that origin from another admintweaks checkout.
+
+**Integration status**
+- `<site>/docs/queuedjobs-enhancements-module-status.md` — how the module was wired into a site (a `_dev/` path repository), the crash-recovery fixes, and the `_dev` vs project-root manifest gotcha (see below).
 
 ## The problem this module solves
 
