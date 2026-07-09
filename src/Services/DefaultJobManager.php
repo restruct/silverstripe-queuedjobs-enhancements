@@ -2,37 +2,48 @@
 
 namespace Restruct\QueuedJobsEnhancements\Services;
 
-use Psr\Log\LoggerInterface;
 use SilverStripe\Core\ClassInfo;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Config\Configurable;
 use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\Core\Injector\Injector;
+use Symfony\Component\Yaml\Yaml;
 use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\AbstractQueuedJob;
 use Symbiote\QueuedJobs\Services\QueuedJob;
 use Symbiote\QueuedJobs\Services\QueuedJobService;
 
 /**
- * Discovers job classes that declare themselves as default/required jobs
- * via `private static bool $is_default_job = true`, and ensures they're
- * in the queue.
+ * Discovery + diagnostics for job classes that declare themselves as default/required
+ * jobs via `private static bool $is_default_job = true`.
  *
- * Works independently alongside the existing QueuedJobService::checkDefaultJobs()
- * mechanism (which handles YAML-configured defaultJobs). Both mechanisms coexist.
+ * This class is DIAGNOSTIC ONLY — it does not create jobs.
+ *
+ * Why: core already ensures default jobs on its own. `QueuedJobService::runQueue()` calls
+ * `checkDefaultJobs()` on every invocation, and `ProcessJobQueueTask` calls `runQueue()`,
+ * so a YAML `defaultJobs` block is re-checked on every cron tick — with alert emails and
+ * health-check integration that a bolt-on re-implementation does not get.
+ *
+ * A module cannot feed discovered jobs into that mechanism: `QueuedJobService::$defaultJobs`
+ * is a public property populated via Injector `properties:`, and neither `runQueue()` nor
+ * `checkDefaultJobs()` exposes an extension hook. Rather than duplicate core's creation
+ * logic (and need its own trigger to run it), this class simply reports what is declared
+ * and can emit the YAML block to paste into your project config.
  *
  * Usage on a job class:
  *   private static bool $is_default_job = true;
  *   private static string $default_schedule = '+5 minutes';
  *   private static int $default_job_type = QueuedJob::QUEUED;       // optional
  *   private static array $default_construct = [];                    // optional
+ *
+ * @see \Restruct\QueuedJobsEnhancements\Tasks\CheckDefaultJobsTask
  */
 class DefaultJobManager
 {
     use Configurable;
     use Injectable;
 
-    # Active job statuses (non-terminal)
+    # Active job statuses (non-terminal) — mirrors core's checkDefaultJobs()
     private const ACTIVE_STATUSES = [
         QueuedJob::STATUS_NEW,
         QueuedJob::STATUS_INIT,
@@ -42,7 +53,7 @@ class DefaultJobManager
     ];
 
     /**
-     * Discover all job classes with $is_default_job = true.
+     * Discover all concrete job classes with $is_default_job = true.
      *
      * @return array<string, array{class: string, schedule: string, construct: array, jobType: ?int}>
      */
@@ -77,73 +88,7 @@ class DefaultJobManager
     }
 
     /**
-     * Ensure all self-declaring default jobs have an active instance in the queue.
-     * Creates missing jobs. Returns array of actions taken (for diagnostic output).
-     *
-     * @return array<string, string> Short name => action ('exists'|'created'|'error')
-     */
-    public static function ensureDefaultJobs(): array
-    {
-        $results = [];
-        $discovered = static::discoverDefaultJobs();
-
-        if (empty($discovered)) {
-            return $results;
-        }
-
-        $service = QueuedJobService::singleton();
-
-        foreach ($discovered as $shortName => $config) {
-            $class = $config['class'];
-
-            try {
-                # Check if an active instance already exists
-                $existing = QueuedJobDescriptor::get()->filter([
-                    'Implementation' => $class,
-                    'JobStatus' => self::ACTIVE_STATUSES,
-                ]);
-
-                if ($existing->exists()) {
-                    $results[$shortName] = 'exists';
-                    continue;
-                }
-
-                # Create and queue a new instance
-                $constructArgs = $config['construct'];
-                $job = Injector::inst()->createWithArgs($class, $constructArgs);
-
-                $startAfter = date('Y-m-d H:i:s', strtotime($config['schedule']));
-                $queue = $config['jobType'] !== null ? (int) $config['jobType'] : null;
-
-                if ($queue !== null) {
-                    # queueJob() is ($job, $startAfter, $userId, $queueName) — the queue override is
-                    # the FOURTH param. Passing it third assigned the queue type to $userId, forcing
-                    # RunAsID to that integer (e.g. Member ID 2) and leaving JobType unchanged.
-                    // $service->queueJob($job, $startAfter, $queue);  // old: $queue landed in $userId
-                    $service->queueJob($job, $startAfter, null, $queue);
-                } else {
-                    $service->queueJob($job, $startAfter);
-                }
-
-                $results[$shortName] = 'created';
-
-                Injector::inst()->get(LoggerInterface::class)->info(
-                    "[DefaultJobManager] Created missing default job: {$shortName} ({$class})"
-                );
-            } catch (\Throwable $e) {
-                $results[$shortName] = 'error';
-
-                Injector::inst()->get(LoggerInterface::class)->warning(
-                    "[DefaultJobManager] Failed to create default job {$shortName}: " . $e->getMessage()
-                );
-            }
-        }
-
-        return $results;
-    }
-
-    /**
-     * Get a diagnostic summary of discovered self-declaring jobs and their queue status.
+     * Diagnostic summary of discovered self-declaring jobs and their current queue status.
      *
      * @return array<string, array{class: string, schedule: string, queued: bool, status: ?string}>
      */
@@ -151,9 +96,7 @@ class DefaultJobManager
     {
         $summary = [];
 
-        $discovered = static::discoverDefaultJobs();
-
-        foreach ($discovered as $shortName => $config) {
+        foreach (static::discoverDefaultJobs() as $shortName => $config) {
             $class = $config['class'];
 
             # Check if an active instance exists in the queue
@@ -171,5 +114,62 @@ class DefaultJobManager
         }
 
         return $summary;
+    }
+
+    /**
+     * Build the core `defaultJobs` config structure for every discovered job.
+     * Paste the YAML rendering of this (see toDefaultJobsYaml()) into your project config
+     * and core's own mechanism takes over — creation, alert emails and health checks.
+     *
+     * @return array<string, mixed> Nested Injector config array
+     */
+    public static function buildDefaultJobsConfig(): array
+    {
+        $jobs = [];
+
+        foreach (static::discoverDefaultJobs() as $shortName => $config) {
+            $entry = [
+                'type' => $config['class'],
+                # Core merges ['Implementation' => type] into this filter, so an empty
+                # filter already matches on implementation alone.
+                'filter' => [],
+                'recreate' => 1,
+                'construct' => $config['construct'],
+                'startDateFormat' => 'Y-m-d H:i:s',
+                'startTimeString' => $config['schedule'],
+                'email' => '',
+            ];
+
+            # Only recreated while the matching queue is being processed — so if you set
+            # this, make sure a runner processes that queue.
+            if ($config['jobType'] !== null) {
+                $entry['jobType'] = (int) $config['jobType'];
+            }
+
+            $jobs[$shortName] = $entry;
+        }
+
+        return [
+            Injector::class => [
+                QueuedJobService::class => [
+                    'properties' => [
+                        'defaultJobs' => $jobs,
+                    ],
+                ],
+            ],
+        ];
+    }
+
+    /**
+     * Render buildDefaultJobsConfig() as a YAML block ready to paste into project config.
+     * Returns an empty string when nothing declares itself a default job.
+     */
+    public static function toDefaultJobsYaml(): string
+    {
+        if (empty(static::discoverDefaultJobs())) {
+            return '';
+        }
+
+        return Yaml::dump(static::buildDefaultJobsConfig(), 6, 2);
     }
 }

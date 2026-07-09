@@ -6,16 +6,16 @@ use Restruct\QueuedJobsEnhancements\Services\DefaultJobManager;
 use SilverStripe\Dev\BuildTask;
 
 /**
- * Ensures self-declaring default jobs are in the queue, and shows diagnostic info.
+ * Diagnostic report for self-declaring default jobs ($is_default_job = true).
  *
- * Discovers all job classes with `$is_default_job = true`, checks whether
- * they have an active instance in the queue, and creates missing ones.
+ * Shows which job classes declare themselves as default jobs and whether each has an
+ * active instance in the queue. This task NEVER creates jobs — scheduling is core's
+ * responsibility via the `defaultJobs` config, which `QueuedJobService::runQueue()`
+ * re-checks on every `ProcessJobQueueTask` run.
  *
  * Usage:
- *   sake dev/tasks/check-default-jobs              # ensure + report
- *   sake dev/tasks/check-default-jobs dry-run=1    # report only, don't create
- *
- * Add to crontab alongside ProcessJobQueueTask for automatic self-declaring job management.
+ *   sake dev/tasks/check-default-jobs           # report declared jobs + queue status
+ *   sake dev/tasks/check-default-jobs yaml=1    # print the defaultJobs YAML to paste
  *
  * @config string $segment
  */
@@ -25,68 +25,35 @@ class CheckDefaultJobsTask extends BuildTask
 
     protected $title = 'Check Default Jobs';
 
-    protected $description = 'Ensures self-declaring default jobs ($is_default_job = true) are in the queue. Creates missing ones.';
+    protected $description = 'Reports job classes declaring $is_default_job = true and whether they are queued. '
+        . 'Creates nothing. Use yaml=1 to emit a defaultJobs config block.';
 
     public function run($request): void
     {
-        $dryRun = (bool) ($request->getVar('dry-run') ?: $request->getVar('dry_run'));
+        if ($request && $request->getVar('yaml')) {
+            $this->outputYaml();
+            return;
+        }
 
+        $this->outputReport();
+    }
+
+    /**
+     * Report every declared default job and whether it is currently active in the queue.
+     */
+    protected function outputReport(): void
+    {
         $this->output('=== Self-Declaring Default Jobs ===');
         $this->output('');
 
-        if ($dryRun) {
-            $this->output('** DRY RUN — no jobs will be created **');
-            $this->output('');
-            $this->showDiagnostic();
-        } else {
-            $this->ensureAndReport();
-        }
-    }
+        $summary = DefaultJobManager::diagnosticSummary();
 
-    protected function ensureAndReport(): void
-    {
-        $results = DefaultJobManager::ensureDefaultJobs();
-
-        if (empty($results)) {
+        if (empty($summary)) {
             $this->output('No job classes with $is_default_job = true found.');
             $this->output('');
             $this->output('To make a job self-declaring, add to your job class:');
             $this->output('  private static bool $is_default_job = true;');
             $this->output('  private static string $default_schedule = \'+5 minutes\';');
-            return;
-        }
-
-        $discovered = DefaultJobManager::discoverDefaultJobs();
-
-        foreach ($results as $shortName => $action) {
-            $class = $discovered[$shortName]['class'] ?? '?';
-            $schedule = $discovered[$shortName]['schedule'] ?? '?';
-
-            $label = match ($action) {
-                'exists' => 'OK (active)',
-                'created' => 'CREATED',
-                'error' => 'ERROR',
-                default => $action,
-            };
-
-            $this->output(sprintf('  [%s] %s', $label, $shortName));
-            $this->output(sprintf('         Class: %s', $class));
-            $this->output(sprintf('         Schedule: %s', $schedule));
-            $this->output('');
-        }
-
-        $created = array_filter($results, fn($a) => $a === 'created');
-        if (!empty($created)) {
-            $this->output(sprintf('Created %d missing default job(s).', count($created)));
-        }
-    }
-
-    protected function showDiagnostic(): void
-    {
-        $summary = DefaultJobManager::diagnosticSummary();
-
-        if (empty($summary)) {
-            $this->output('No job classes with $is_default_job = true found.');
             return;
         }
 
@@ -100,6 +67,35 @@ class CheckDefaultJobsTask extends BuildTask
             $this->output(sprintf('         Schedule: %s', $info['schedule']));
             $this->output('');
         }
+
+        $missing = array_filter($summary, fn($info) => !$info['queued']);
+        if (!empty($missing)) {
+            $this->output(sprintf('%d job(s) are not currently queued.', count($missing)));
+            $this->output('');
+        }
+
+        # This task deliberately creates nothing — point at the mechanism that does
+        $this->output('This task does not create jobs. To have them created and kept alive,');
+        $this->output('add them to the core `defaultJobs` config. Run with yaml=1 to print it:');
+        $this->output('  sake dev/tasks/check-default-jobs yaml=1');
+    }
+
+    /**
+     * Emit the `defaultJobs` YAML block for the discovered jobs, ready to paste.
+     */
+    protected function outputYaml(): void
+    {
+        $yaml = DefaultJobManager::toDefaultJobsYaml();
+
+        if ($yaml === '') {
+            $this->output('# No job classes with $is_default_job = true found.');
+            return;
+        }
+
+        $this->output('# Paste into e.g. app/_config/queuedjobs.yml');
+        $this->output('# Core re-checks these on every ProcessJobQueueTask run (QueuedJobService::runQueue()).');
+        $this->output('');
+        $this->output($yaml);
     }
 
     protected function output(string $message): void

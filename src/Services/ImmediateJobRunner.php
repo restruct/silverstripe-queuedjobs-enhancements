@@ -24,6 +24,9 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  * This class never replaces or subclasses core QueuedJobs classes.
  *
  * @config bool $use_immediate_queue
+ * @config bool $use_spawn_lock
+ * @config string $spawn_lock_file
+ * @config int $spawn_lock_timeout
  */
 class ImmediateJobRunner
 {
@@ -33,8 +36,29 @@ class ImmediateJobRunner
     /**
      * Set true if inotifywait (or similar) is monitoring the IMMEDIATE queue.
      * When true, jobs are queued as QueuedJob::IMMEDIATE instead of spawning a CLI process.
+     *
+     * Requires QueuedJobService.use_shutdown_function: false, otherwise no trigger file
+     * is written and nothing can pick the job up (see queueAndRun()).
      */
     private static bool $use_immediate_queue = false;
+
+    /**
+     * Serialise spawned runners behind a `flock` lock. Without this, a burst of dispatches
+     * forks an unbounded number of PHP processes, each bootstrapping the whole framework.
+     * Silently ignored when no flock binary exists (e.g. macOS).
+     */
+    private static bool $use_spawn_lock = true;
+
+    /**
+     * Lock file for the above. Relative paths resolve under TEMP_FOLDER.
+     */
+    private static string $spawn_lock_file = 'queuedjobs-enhancements-spawn.lock';
+
+    /**
+     * Seconds a spawned runner waits for the lock before giving up (the job stays queued,
+     * so cron still runs it). 0 or less means "fail immediately" (flock -n).
+     */
+    private static int $spawn_lock_timeout = 300;
 
     /**
      * Queue a job and trigger immediate execution.
@@ -98,33 +122,114 @@ class ImmediateJobRunner
             return;
         }
 
+        $cmd = static::buildSpawnCommand($descriptorId);
+        if ($cmd === null) {
+            return;
+        }
+
+        exec($cmd);
+    }
+
+    /**
+     * Build the shell command that runs a single queued job in a detached process.
+     * Returns null when the command cannot be built (job then waits for cron).
+     *
+     * Kept separate from spawnJobProcess() so it can be asserted on in tests without
+     * actually shelling out.
+     */
+    protected static function buildSpawnCommand(int $descriptorId): ?string
+    {
         # Use cli-script.php directly — more reliable than sake (see SSKB cli-commands profile)
         $cliScript = BASE_PATH . '/vendor/silverstripe/framework/cli-script.php';
         if (!file_exists($cliScript)) {
             static::log("Cannot spawn job #{$descriptorId}: cli-script.php not found at {$cliScript}");
-            return;
+            return null;
         }
 
         # Find the PHP binary — use PHP_BINARY which gives us the exact binary running the current request
         $phpBinary = PHP_BINARY ?: 'php';
 
-        # Build command: nohup detaches from parent, /dev/null discards output, & runs in background
-        #
         # The "queuedjob-" prefix is REQUIRED. ProcessJobQueueTask only enters single-job mode
         # when the job param contains a dash — `if (($job = $request->getVar('job')) && strpos($job, '-'))`
         # — taking the part after the dash as the descriptor ID. This matches the `queuedjob-{ID}`
         # trigger-file names inotifywait passes as `%f`. A bare `job=42` fails that check and falls
         # through to runQueue('Queued'), draining the ENTIRE queued queue instead of this one job
         # (and missing the job entirely if it is a LARGE or IMMEDIATE job).
-        $cmd = sprintf(
-            // 'nohup %s %s dev/tasks/ProcessJobQueueTask job=%d > /dev/null 2>&1 &',  // old: bare ID, no dash
-            'nohup %s %s dev/tasks/ProcessJobQueueTask job=queuedjob-%d > /dev/null 2>&1 &',
+        $inner = sprintf(
+            // '%s %s dev/tasks/ProcessJobQueueTask job=%d',  // old: bare ID, no dash
+            '%s %s dev/tasks/ProcessJobQueueTask job=queuedjob-%d',
             escapeshellarg($phpBinary),
             escapeshellarg($cliScript),
             $descriptorId
         );
 
-        exec($cmd);
+        # Optionally serialise spawns behind a lock so a burst of dispatches cannot fork an
+        # unbounded number of PHP processes (each one bootstraps the whole framework). This
+        # mirrors what the inotifywait watcher gets for free: `inotifywait … | sh` feeds
+        # commands into a single shell, which runs them one at a time.
+        $inner = static::wrapWithLock($inner);
+
+        # nohup detaches from the parent, /dev/null discards output (without the redirect
+        # PHP's exec() blocks until stdout closes), & backgrounds it.
+        return sprintf('nohup %s > /dev/null 2>&1 &', $inner);
+    }
+
+    /**
+     * Prefix a command with `flock` so at most one spawned runner executes at a time.
+     * Returns the command unchanged when locking is disabled or flock is unavailable.
+     */
+    protected static function wrapWithLock(string $command): string
+    {
+        $config = static::singleton()->config();
+
+        if (!$config->get('use_spawn_lock')) {
+            return $command;
+        }
+
+        $flock = static::resolveFlockBinary();
+        if ($flock === null) {
+            # macOS has no util-linux flock; degrade to unlocked spawn rather than silently
+            # producing a command that does not exist.
+            static::log('use_spawn_lock is enabled but no flock binary was found; spawning without a lock.');
+            return $command;
+        }
+
+        $lockFile = (string) $config->get('spawn_lock_file');
+        if ($lockFile === '' || $lockFile[0] !== '/') {
+            $lockFile = TEMP_FOLDER . '/' . ($lockFile ?: 'queuedjobs-enhancements-spawn.lock');
+        }
+
+        $timeout = (int) $config->get('spawn_lock_timeout');
+
+        # -w waits up to N seconds for the lock then gives up (the job stays queued, so cron
+        # still runs it). -n fails immediately. Waiting is usually right here: the process is
+        # already detached, so blocking costs nothing and no dispatch gets dropped.
+        $waitOpt = $timeout > 0 ? sprintf('-w %d', $timeout) : '-n';
+
+        return sprintf(
+            '%s %s %s %s',
+            escapeshellarg($flock),
+            $waitOpt,
+            escapeshellarg($lockFile),
+            $command
+        );
+    }
+
+    /**
+     * Locate the util-linux `flock` binary, or null when it is not installed.
+     */
+    protected static function resolveFlockBinary(): ?string
+    {
+        foreach (['/usr/bin/flock', '/bin/flock'] as $candidate) {
+            if (@is_executable($candidate)) {
+                return $candidate;
+            }
+        }
+
+        $found = @shell_exec('command -v flock 2>/dev/null');
+        $found = is_string($found) ? trim($found) : '';
+
+        return $found !== '' ? $found : null;
     }
 
     /**

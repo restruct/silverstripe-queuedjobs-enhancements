@@ -4,17 +4,20 @@ namespace Restruct\QueuedJobsEnhancements\Tests\Services;
 
 use Restruct\QueuedJobsEnhancements\Services\DefaultJobManager;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubDefaultJob;
-use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubNonDefaultJob;
-use SilverStripe\Core\Config\Config;
 use SilverStripe\Dev\SapphireTest;
+use Symfony\Component\Yaml\Yaml;
 use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
+use Symbiote\QueuedJobs\Services\QueuedJobService;
 
+/**
+ * DefaultJobManager is diagnostic only — it discovers, reports, and can emit the core
+ * `defaultJobs` config. It never creates jobs; core's checkDefaultJobs() does that, and
+ * it runs on every ProcessJobQueueTask invocation via QueuedJobService::runQueue().
+ */
 class DefaultJobManagerTest extends SapphireTest
 {
     protected $usesDatabase = true;
-
-    protected static $extra_dataobjects = [];
 
     public function testDiscoverDefaultJobsFindsAnnotatedClasses(): void
     {
@@ -31,39 +34,6 @@ class DefaultJobManagerTest extends SapphireTest
         $discovered = DefaultJobManager::discoverDefaultJobs();
 
         $this->assertArrayNotHasKey('StubNonDefaultJob', $discovered);
-    }
-
-    public function testEnsureDefaultJobsCreatesWhenMissing(): void
-    {
-        # No jobs in queue initially
-        $this->assertEquals(0, QueuedJobDescriptor::get()->filter('Implementation', StubDefaultJob::class)->count());
-
-        $results = DefaultJobManager::ensureDefaultJobs();
-
-        $this->assertArrayHasKey('StubDefaultJob', $results);
-        $this->assertEquals('created', $results['StubDefaultJob']);
-
-        # Verify job was actually created in the queue
-        $descriptor = QueuedJobDescriptor::get()->filter('Implementation', StubDefaultJob::class)->first();
-        $this->assertNotNull($descriptor);
-    }
-
-    public function testEnsureDefaultJobsSkipsExisting(): void
-    {
-        # Create a job manually first
-        $descriptor = QueuedJobDescriptor::create();
-        $descriptor->Implementation = StubDefaultJob::class;
-        $descriptor->JobStatus = QueuedJob::STATUS_NEW;
-        $descriptor->JobTitle = 'Stub default job';
-        $descriptor->write();
-
-        $results = DefaultJobManager::ensureDefaultJobs();
-
-        $this->assertArrayHasKey('StubDefaultJob', $results);
-        $this->assertEquals('exists', $results['StubDefaultJob']);
-
-        # Should still be only 1 instance
-        $this->assertEquals(1, QueuedJobDescriptor::get()->filter('Implementation', StubDefaultJob::class)->count());
     }
 
     public function testDiagnosticSummaryShowsQueueStatus(): void
@@ -87,19 +57,60 @@ class DefaultJobManagerTest extends SapphireTest
         $this->assertEquals(QueuedJob::STATUS_RUN, $summary['StubDefaultJob']['status']);
     }
 
-    public function testEnsureDefaultJobsIgnoresTerminalStatuses(): void
+    public function testDiagnosticSummaryIgnoresTerminalStatuses(): void
     {
-        # Create a completed job (terminal status)
+        # A completed job is terminal — it does not count as an active instance
         $descriptor = QueuedJobDescriptor::create();
         $descriptor->Implementation = StubDefaultJob::class;
         $descriptor->JobStatus = QueuedJob::STATUS_COMPLETE;
         $descriptor->JobTitle = 'Stub default job';
         $descriptor->write();
 
-        # Should create a new one since the existing one is terminal
-        $results = DefaultJobManager::ensureDefaultJobs();
+        $summary = DefaultJobManager::diagnosticSummary();
 
-        $this->assertEquals('created', $results['StubDefaultJob']);
-        $this->assertEquals(2, QueuedJobDescriptor::get()->filter('Implementation', StubDefaultJob::class)->count());
+        $this->assertFalse($summary['StubDefaultJob']['queued']);
+    }
+
+    public function testNeverCreatesJobs(): void
+    {
+        $before = QueuedJobDescriptor::get()->count();
+
+        DefaultJobManager::discoverDefaultJobs();
+        DefaultJobManager::diagnosticSummary();
+        DefaultJobManager::toDefaultJobsYaml();
+
+        $this->assertEquals(
+            $before,
+            QueuedJobDescriptor::get()->count(),
+            'DefaultJobManager must never create job descriptors'
+        );
+    }
+
+    public function testBuildDefaultJobsConfigMatchesCoreSchema(): void
+    {
+        $config = DefaultJobManager::buildDefaultJobsConfig();
+
+        $jobs = $config['SilverStripe\Core\Injector\Injector']
+            [QueuedJobService::class]['properties']['defaultJobs'];
+
+        $this->assertArrayHasKey('StubDefaultJob', $jobs);
+        $entry = $jobs['StubDefaultJob'];
+
+        # Keys core's checkDefaultJobs() requires: type + filter, plus (for recreation)
+        # recreate + construct + startDateFormat + startTimeString
+        $this->assertEquals(StubDefaultJob::class, $entry['type']);
+        $this->assertArrayHasKey('filter', $entry);
+        $this->assertEquals(1, $entry['recreate']);
+        $this->assertArrayHasKey('construct', $entry);
+        $this->assertEquals('Y-m-d H:i:s', $entry['startDateFormat']);
+        $this->assertEquals('+10 minutes', $entry['startTimeString']);
+    }
+
+    public function testToDefaultJobsYamlIsParseableAndRoundTrips(): void
+    {
+        $yaml = DefaultJobManager::toDefaultJobsYaml();
+        $this->assertNotSame('', $yaml);
+
+        $this->assertEquals(DefaultJobManager::buildDefaultJobsConfig(), Yaml::parse($yaml));
     }
 }

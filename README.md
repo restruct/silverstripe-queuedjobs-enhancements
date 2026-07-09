@@ -1,28 +1,21 @@
 # Silverstripe QueuedJobs Enhancements
 
-Progress tracking, immediate execution, self-declaring default jobs, and consolidation utilities for [symbiote/silverstripe-queuedjobs](https://github.com/symbiote/silverstripe-queuedjobs).
+Progress tracking, immediate execution, and consolidation utilities for [symbiote/silverstripe-queuedjobs](https://github.com/symbiote/silverstripe-queuedjobs).
 
-`symbiote/silverstripe-queuedjobs` is solid for background processing, but the developer and end-user experience around it has some rough edges: a queued job gives no live feedback (the browser only learns it finished on the next page reload), jobs wait for the next cron tick before they start, auto-recreating "default" jobs need a verbose block of YAML per job, and there is no first-class way to queue a one-off method call or closure. This module adds those pieces as small, independent components that sit **alongside** the core module — it never replaces or subclasses core QueuedJobs classes.
+`symbiote/silverstripe-queuedjobs` is solid for background processing, but the developer and end-user experience around it has some rough edges: a queued job gives no live feedback (the browser only learns it finished on the next page reload), jobs wait for the next cron tick before they start, and there is no first-class way to queue a one-off method call. This module adds those pieces as small, independent components that sit **alongside** the core module — it never replaces or subclasses core QueuedJobs classes.
 
 ## Requirements
 
 - PHP `^8.1`
 - `silverstripe/framework` `^5`
 - `symbiote/silverstripe-queuedjobs` `^5`
-- For `ClosureJob` only: a closure-serialization library must be present —
-  `silverstripe/closure` on SS5. It is normally already in the dependency tree
-  (pulled in transitively by `silverstripe/doorman`), so no extra `require` is
-  usually needed. See [ClosureJob](#5-closurejob) for the SS6 import note.
 
 > **SS6 is not supported yet.** Earlier releases advertised `^6`, but the module cannot
 > boot on SS6: `SilverStripe\Dev\BuildTask` there extends `PolyCommand` with an
 > incompatible signature (`execute(InputInterface, PolyOutput): int`, plus a `static`
 > `$description`), so `CheckDefaultJobsTask` and `CleanupBrokenJobsTask` fatal on class
-> load. `cli-script.php` (used by `ImmediateJobRunner`) was also removed in SS6, and
-> `ClosureJob` needs `laravel/serializable-closure` instead of the abandoned Opis library.
+> load. `cli-script.php` (used by `ImmediateJobRunner`) was also removed in SS6.
 > The constraint is narrowed to `^5` until proper SS6 support is built.
-
-These are declared as `suggest` (not hard `require`) in `composer.json` because they only matter if you use `ClosureJob`.
 
 ## Installation
 
@@ -39,8 +32,10 @@ php vendor/silverstripe/framework/cli-script.php dev/build flush=1
 The module registers:
 
 - A route `api/job-progress//$ID` → `JobProgressController` (via `_config/routes.yml`).
-- An extension on `QueuedJobsAdmin` that ensures self-declaring default jobs exist on admin visits (via `_config/config.yml`).
+- Two dev tasks: `check-default-jobs` and `cleanup-broken-jobs`.
 - Exposes `client/` (for `client/js/job-progress.js`) via `extra.expose` in `composer.json`.
+
+It registers no extensions and adds no runtime hooks — nothing runs unless you call it.
 
 ## Features
 
@@ -129,14 +124,27 @@ The background process is spawned as `nohup <PHP_BINARY> vendor/silverstripe/fra
 
 > **The `queuedjob-` prefix is mandatory.** `ProcessJobQueueTask` only enters single-job mode when the `job` parameter contains a dash. A bare `job=42` silently falls through to draining the entire *Queued* queue.
 
-Because the spawn is a separate CLI process, it does **not** occupy a PHP-FPM worker (that is the failure mode of `fastcgi_finish_request()`, which this module deliberately avoids). The real cost is that each dispatch bootstraps Silverstripe in a new process, and nothing caps how many run concurrently.
+Because the spawn is a separate CLI process, it does **not** occupy a PHP-FPM worker (that is the failure mode of `fastcgi_finish_request()`, which this module deliberately avoids). The real cost is that each dispatch bootstraps Silverstripe in a new process — so spawns are serialised behind a `flock` lock by default (see below).
+
+**Concurrency (`flock`).** Without a lock, a burst of dispatches forks an unbounded number of PHP processes, each bootstrapping the whole framework. `use_spawn_lock` (on by default) wraps the spawn in `flock`, so at most one spawned runner executes at a time — the same property the `inotifywait` watcher gets for free, since `inotifywait … | sh` feeds commands into a single shell. Waiting is the default rather than failing fast: the process is already detached, so blocking costs nothing and no dispatch is dropped. If the wait times out the job simply stays queued and cron picks it up.
+
+`flock` comes from util-linux and is **absent on macOS**; when no binary is found the module logs a warning and spawns without a lock rather than emitting a command that cannot run.
 
 **Configuration:**
 
 ```yaml
-# Set true only if inotifywait (or similar) monitors the IMMEDIATE queue.
 Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
+  # Set true only if inotifywait (or similar) monitors the IMMEDIATE queue.
   use_immediate_queue: false
+
+  # Serialise spawned runners so a burst cannot fork unbounded PHP processes.
+  use_spawn_lock: true
+  # Relative paths resolve under TEMP_FOLDER. Pin an absolute path if you want the
+  # lock shared across deployments (TEMP_FOLDER is derived from BASE_PATH, which
+  # changes per release on zero-downtime deploys).
+  spawn_lock_file: 'queuedjobs-enhancements-spawn.lock'
+  # Seconds to wait for the lock before giving up (job stays queued). 0 = fail fast (flock -n).
+  spawn_lock_timeout: 300
 ```
 
 > **`use_immediate_queue: true` has a prerequisite.** The trigger file that `inotifywait` watches is
@@ -153,29 +161,21 @@ Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
 > shutdown function also removes the behaviour where a CLI cron run drains the IMMEDIATE queue as it
 > exits — so keep a `queue=immediate` cron entry as a safety net if you rely on that.
 
-### 3. Self-Declaring Default Jobs
+### 3. Default-Job Diagnostics (`$is_default_job`)
 
-Replace the verbose `defaultJobs` YAML block with a single declaration on the job class itself.
+> **Scheduling is core's job, not this module's.** `QueuedJobService::runQueue()` calls
+> `checkDefaultJobs()` on *every* invocation, and `ProcessJobQueueTask` calls `runQueue()` —
+> so a plain YAML `defaultJobs` block is already re-checked on every cron tick, with **zero**
+> extra setup, plus core's alert emails and health-check integration. This module therefore
+> **does not create or schedule default jobs**. It only reports what's declared, and can
+> generate the YAML for you.
+>
+> (It cannot hand discovered jobs to core either: `QueuedJobService::$defaultJobs` is a public
+> property populated via Injector `properties:`, and neither `runQueue()` nor `checkDefaultJobs()`
+> exposes an extension hook. Re-implementing core's creation logic to work around that is what
+> earlier versions did — and it bought nothing but a second, less capable mechanism.)
 
-**Before** (YAML `defaultJobs` — many lines per job):
-
-```yaml
-SilverStripe\Core\Injector\Injector:
-  Symbiote\QueuedJobs\Services\QueuedJobService:
-    properties:
-      defaultJobs:
-        DataSyncJob:
-          type: 'App\Jobs\DataSyncJob'
-          filter:
-            JobTitle: 'App\Jobs\DataSyncJob'
-          recreate: 1
-          startDateFormat: 'Y-m-d H:i:s'
-          startTimeString: '+5 minutes'
-          email: ''
-          construct: {}
-```
-
-**After** (on the job class — 2 lines, plus optional overrides):
+Declare a job's schedule next to the job itself:
 
 ```php
 class DataSyncJob extends AbstractQueuedJob implements QueuedJob
@@ -184,56 +184,28 @@ class DataSyncJob extends AbstractQueuedJob implements QueuedJob
     private static string $default_schedule = '+5 minutes';
 
     // Optional:
-    private static int $default_job_type = QueuedJob::QUEUED; // omit → queueJob() default
+    private static int $default_job_type = QueuedJob::QUEUED; // adds `jobType` to the emitted config
     private static array $default_construct = [];             // constructor args
 }
 ```
 
-`DefaultJobManager` discovers every concrete `AbstractQueuedJob` subclass with `$is_default_job = true` (via `ClassInfo::subclassesFor()`, skipping abstract classes), and ensures each has an *active* instance in the queue. "Active" means a descriptor in a non-terminal status (`New`, `Initialising`, `Running`, `Waiting`, or `Paused`); if none exists it creates one, scheduled per `$default_schedule` (default `+5 minutes`). Creation failures are caught and logged, not thrown.
+`DefaultJobManager` discovers every concrete `AbstractQueuedJob` subclass with `$is_default_job = true` (via `ClassInfo::subclassesFor()`, skipping abstract classes) and reports whether each has an *active* instance in the queue — "active" meaning a descriptor in a non-terminal status (`New`, `Initialising`, `Running`, `Waiting`, `Paused`).
 
-This works **independently** of the core `defaultJobs` mechanism — the two coexist. `DefaultJobManager` creates jobs directly; it does not modify `defaultJobs` config.
-
-> **Do you actually need this?** Core already calls `QueuedJobService::checkDefaultJobs()` from
-> `runQueue()` — i.e. on *every* `ProcessJobQueueTask` run. So a plain YAML `defaultJobs` block is
-> already re-checked every cron tick, with **zero** extra setup, and it gets core's alert emails and
-> health-check integration for free. The only thing this feature buys you is co-locating the schedule
-> with the job class. It cannot feed into core's `defaultJobs` (that's a public property populated via
-> Injector `properties:`, and `runQueue()` exposes no extension hook), which is why it has to create
-> jobs itself — and why it needs its own trigger. If YAML is tolerable, prefer YAML.
-
-**Triggering:**
-
-- **Admin visits:** `DefaultJobServiceExtension` (applied to `QueuedJobsAdmin`) calls
-  `DefaultJobManager::ensureDefaultJobs()` on `onAfterInit()`. It is permission-guarded
-  (`canView()`) and throttled to once per `check_interval` seconds (default 300).
-- **Cron:** run the `check-default-jobs` task on a schedule.
-- **Manual:** `sake dev/tasks/check-default-jobs`
-- **Dry run (report only, creates nothing):** `sake dev/tasks/check-default-jobs dry-run=1`
-
-```yaml
-# Throttle for the admin-visit trigger. 0 = check on every request.
-Restruct\QueuedJobsEnhancements\Extensions\DefaultJobServiceExtension:
-  check_interval: 300
-```
-
-**Optional cron (only if you don't want to rely on admin visits):**
+**Report what's declared and whether it's queued:**
 
 ```bash
-# Existing: process the job queue every minute
-* * * * * php /path/to/vendor/silverstripe/framework/cli-script.php dev/tasks/ProcessJobQueueTask queue=queued
-
-# Optional: ensure self-declaring default jobs exist
-*/5 * * * * php /path/to/vendor/silverstripe/framework/cli-script.php dev/tasks/check-default-jobs
+sake dev/tasks/check-default-jobs
 ```
 
-#### The `check-default-jobs` task
-
-The trigger/diagnostic task for this feature. Without arguments it ensures missing default jobs are created and prints a per-job report (`OK (active)` / `CREATED` / `ERROR`). With `dry-run=1` it only reports the discovered jobs and their queue status, creating nothing.
+**Generate the core `defaultJobs` YAML to paste into your project config:**
 
 ```bash
-sake dev/tasks/check-default-jobs           # ensure + report
-sake dev/tasks/check-default-jobs dry-run=1 # report only
+sake dev/tasks/check-default-jobs yaml=1
 ```
+
+That emits exactly the structure core's `checkDefaultJobs()` expects (`type`, `filter`, `recreate`, `construct`, `startDateFormat`, `startTimeString`, and `jobType` when `$default_job_type` is set). Paste it into e.g. `app/_config/queuedjobs.yml` and core takes over — creation, alert emails, health checks. You get the co-location benefit while authoring, without a second runtime mechanism to maintain.
+
+> `jobType` restricts recreation to runs of *that* queue, so if you set `$default_job_type`, make sure a runner processes that queue.
 
 ### 4. ScheduledMethodCall
 
@@ -270,45 +242,7 @@ For instance calls, the running job instance is exposed to the target object as 
 | `totalSteps` | `1` | Total steps (for multi-step processing) |
 | `ignoreIdentical` | `false` | When `true`, appends a random signature so identical jobs can coexist in the queue |
 
-### 5. ClosureJob
-
-Queue a closure for background execution — no dedicated job class needed.
-
-```php
-use Restruct\QueuedJobsEnhancements\Jobs\ClosureJob;
-
-// Simple dispatch
-ClosureJob::dispatch(
-    function () use ($itemId) {
-        $item = MyModel::get()->byID($itemId);
-        $item->doExpensiveWork();
-    },
-    description: 'Process item #' . $itemId
-);
-
-// Immediate execution (CLI spawn)
-ClosureJob::dispatchImmediate(
-    fn() => MyService::singleton()->rebuildCache(),
-    'Rebuild cache'
-);
-
-// Scheduled (strtotime-compatible)
-ClosureJob::dispatch(
-    fn() => Email::create()->setTo('admin@example.com')->send(),
-    description: 'Send daily report',
-    when: '+1 day'
-);
-```
-
-If the closure returns a value, it is added as a job message (strings verbatim, otherwise JSON-encoded).
-
-**Capture IDs, not objects.** Closures are serialized at dispatch time. Capture scalar values (IDs, strings) in `use()` and re-fetch `DataObject`s inside the closure body — `DataObject`s are not safely serializable and would be stale by the time the job runs.
-
-**How serialization works.** The closure is wrapped in `SerializableClosure` and `serialize()`'d to a plain string *before* it enters the job data. When QueuedJobs later serializes the saved job data, it only ever sees a string — no closure in the serialization path.
-
-**SS5 vs SS6.** The current source imports `Opis\Closure\SerializableClosure` (provided by `silverstripe/closure` on SS5). For SS6, swap the import to `Laravel\SerializableClosure\SerializableClosure` (from `laravel/serializable-closure`) — the API is identical. See [RESEARCH.md](docs/RESEARCH.md) for the background on this migration.
-
-### 6. CleanupBrokenJobsTask
+### 5. CleanupBrokenJobsTask
 
 Delete every queued job whose status is `Broken`:
 
@@ -322,7 +256,7 @@ Only `Broken` jobs are removed; all other statuses are left untouched.
 
 | Task | Segment | Description |
 |------|---------|-------------|
-| Check Default Jobs | `check-default-jobs` | Ensure self-declaring default jobs are queued (`dry-run=1` to report only) |
+| Check Default Jobs | `check-default-jobs` | Report declared default jobs and whether they're queued (`yaml=1` emits the core `defaultJobs` config). Creates nothing. |
 | Cleanup Broken Jobs | `cleanup-broken-jobs` | Delete all broken jobs |
 
 ## Module Structure
@@ -331,16 +265,13 @@ Only `Broken` jobs are removed; all other statuses are left untouched.
 src/
 ├── Controllers/
 │   └── JobProgressController.php       # REST API for job progress
-├── Extensions/
-│   └── DefaultJobServiceExtension.php  # Ensures default jobs on QueuedJobsAdmin visit (guarded + throttled)
 ├── Jobs/
-│   ├── ClosureJob.php                  # Queue closures
 │   └── ScheduledMethodCall.php         # Queue method calls
 ├── Services/
-│   ├── DefaultJobManager.php           # Self-declaring job discovery + creation
-│   └── ImmediateJobRunner.php          # CLI spawn for immediate execution
+│   ├── DefaultJobManager.php           # Default-job discovery + diagnostics + YAML emitter
+│   └── ImmediateJobRunner.php          # CLI spawn (flock-serialised) for immediate execution
 └── Tasks/
-    ├── CheckDefaultJobsTask.php        # Ensure default jobs are queued
+    ├── CheckDefaultJobsTask.php        # Report default jobs / emit defaultJobs YAML
     └── CleanupBrokenJobsTask.php       # Delete broken jobs
 
 client/js/
@@ -354,7 +285,9 @@ vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests/
 # expected: OK (35 tests, 84 assertions)
 ```
 
-The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `ClosureJob` (including serialize→unserialize→process round-trip), `DefaultJobManager`, `ImmediateJobRunner` (queue/`RunAsID` regression tests and the IMMEDIATE trigger-file contract), and `CleanupBrokenJobsTask`.
+The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, the `queuedjob-` spawn contract, `flock` wrapping, and the IMMEDIATE trigger-file contract), and `CleanupBrokenJobsTask`.
+
+The `flock` tests stub the binary lookup, so the lock-wrapping and no-flock branches are both exercised on macOS *and* Linux rather than being skipped on whichever platform lacks `flock`.
 
 > **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` — the tests follow this convention deliberately.
 

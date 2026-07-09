@@ -1,16 +1,12 @@
 {
     "name": "restruct/silverstripe-queuedjobs-enhancements",
-    "description": "Progress tracking, immediate execution, self-declaring default jobs, and consolidation utilities for symbiote/silverstripe-queuedjobs",
+    "description": "Progress tracking, immediate execution, and consolidation utilities for symbiote/silverstripe-queuedjobs",
     "type": "silverstripe-vendormodule",
     "license": "MIT",
     "require": {
         "php": "^8.1",
         "silverstripe/framework": "^5",
         "symbiote/silverstripe-queuedjobs": "^5"
-    },
-    "suggest": {
-        "silverstripe/closure": "Required for ClosureJob on SS5 (installed via doorman)",
-        "laravel/serializable-closure": "Required for ClosureJob on SS6 (installed via doorman)"
     },
     "autoload": {
         "psr-4": {

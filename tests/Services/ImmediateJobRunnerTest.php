@@ -85,6 +85,97 @@ class ImmediateJobRunnerTest extends SapphireTest
     }
 
     /**
+     * Invoke the protected command builder without shelling out.
+     */
+    protected function buildSpawnCommand(int $descriptorId): ?string
+    {
+        $method = new \ReflectionMethod(ImmediateJobRunner::class, 'buildSpawnCommand');
+        $method->setAccessible(true);
+
+        return $method->invoke(null, $descriptorId);
+    }
+
+    public function testSpawnCommandUsesQueuedjobDashPrefix(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_spawn_lock', false);
+
+        $cmd = $this->buildSpawnCommand(123);
+        $this->assertNotNull($cmd, 'cli-script.php should exist on SS5');
+
+        # Without the dash, ProcessJobQueueTask falls through to draining the whole queue
+        $this->assertStringContainsString('job=queuedjob-123', $cmd);
+        $this->assertStringNotContainsString('job=123', $cmd);
+
+        # Detached, output discarded (exec() blocks otherwise)
+        $this->assertStringContainsString('nohup', $cmd);
+        $this->assertStringContainsString('> /dev/null 2>&1 &', $cmd);
+    }
+
+    /**
+     * Covers the lock wrapping on every platform by stubbing the binary lookup —
+     * macOS has no util-linux `flock`, so relying on the real binary would silently
+     * skip this on local dev and only exercise it in CI.
+     */
+    public function testSpawnCommandIsLockWrappedWhenEnabled(): void
+    {
+        Config::modify()->set(StubFlockImmediateJobRunner::class, 'use_spawn_lock', true);
+        Config::modify()->set(StubFlockImmediateJobRunner::class, 'spawn_lock_timeout', 42);
+
+        $method = new \ReflectionMethod(StubFlockImmediateJobRunner::class, 'buildSpawnCommand');
+        $method->setAccessible(true);
+        $cmd = $method->invoke(null, 123);
+
+        $this->assertStringContainsString('flock', $cmd);
+        $this->assertStringContainsString('-w 42', $cmd);
+        $this->assertStringContainsString('job=queuedjob-123', $cmd);
+        # flock must wrap the php command, not follow it
+        $this->assertLessThan(
+            strpos($cmd, 'ProcessJobQueueTask'),
+            strpos($cmd, 'flock'),
+            'flock must precede the command it guards'
+        );
+    }
+
+    public function testSpawnCommandUsesNonBlockingLockWhenTimeoutIsZero(): void
+    {
+        Config::modify()->set(StubFlockImmediateJobRunner::class, 'use_spawn_lock', true);
+        Config::modify()->set(StubFlockImmediateJobRunner::class, 'spawn_lock_timeout', 0);
+
+        $method = new \ReflectionMethod(StubFlockImmediateJobRunner::class, 'buildSpawnCommand');
+        $method->setAccessible(true);
+        $cmd = $method->invoke(null, 5);
+
+        $this->assertStringContainsString(' -n ', $cmd);
+        $this->assertStringNotContainsString('-w ', $cmd);
+    }
+
+    /**
+     * With no flock binary available the command must still be produced, unlocked,
+     * rather than referencing a binary that does not exist.
+     */
+    public function testSpawnCommandDegradesGracefullyWithoutFlockBinary(): void
+    {
+        Config::modify()->set(StubNoFlockImmediateJobRunner::class, 'use_spawn_lock', true);
+
+        $method = new \ReflectionMethod(StubNoFlockImmediateJobRunner::class, 'buildSpawnCommand');
+        $method->setAccessible(true);
+        $cmd = $method->invoke(null, 9);
+
+        $this->assertStringNotContainsString('flock', $cmd);
+        $this->assertStringContainsString('job=queuedjob-9', $cmd);
+    }
+
+    public function testSpawnCommandOmitsLockWhenDisabled(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_spawn_lock', false);
+
+        $cmd = $this->buildSpawnCommand(7);
+
+        $this->assertStringNotContainsString('flock', $cmd);
+        $this->assertStringContainsString('job=queuedjob-7', $cmd);
+    }
+
+    /**
      * Guards the documented prerequisite for the inotify path: the trigger file that
      * inotifywait watches is only written when JobType === IMMEDIATE *and*
      * QueuedJobService.use_shutdown_function is false (QueuedJobDescriptor::activateOnQueue()).
@@ -108,5 +199,27 @@ class ImmediateJobRunnerTest extends SapphireTest
             $jobDir . '/queuedjob-' . $descriptorId,
             'IMMEDIATE + use_shutdown_function:false must write the inotify trigger file'
         );
+    }
+}
+
+/**
+ * Pretends flock is installed, so the lock-wrapping branch is covered on macOS too.
+ */
+class StubFlockImmediateJobRunner extends ImmediateJobRunner
+{
+    protected static function resolveFlockBinary(): ?string
+    {
+        return '/usr/bin/flock';
+    }
+}
+
+/**
+ * Pretends flock is absent, exercising the graceful-degradation branch on Linux too.
+ */
+class StubNoFlockImmediateJobRunner extends ImmediateJobRunner
+{
+    protected static function resolveFlockBinary(): ?string
+    {
+        return null;
     }
 }

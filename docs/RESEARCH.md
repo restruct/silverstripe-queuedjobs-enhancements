@@ -92,30 +92,35 @@ The job is **always queued first** as a safety net: if the spawn fails (e.g. `ex
 
 The verbose `defaultJobs` YAML (redundant `type`/`filter`, required-but-empty `email`/`construct` keys, repeated per job) is replaced by `$is_default_job = true` + `$default_schedule` on the class itself, so scheduling lives with the job (single responsibility).
 
-**Implementation note — the delivered design is simpler than the original sketch.** The research doc first proposed that a `DefaultJobServiceExtension` *merge* discovered jobs into the core `QueuedJobService.defaultJobs` config (letting the existing recreation + email mechanism do the work), with the BuildTask being diagnostic-only. The delivered code took a more self-contained route:
+**Implementation note — this was reworked in 1.2.0, and the original sketch was right.** The research doc first proposed that a `DefaultJobServiceExtension` *merge* discovered jobs into the core `QueuedJobService.defaultJobs` config (letting the existing recreation + email mechanism do the work), with the BuildTask being diagnostic-only. Versions 1.0–1.1 instead took a self-contained route: `DefaultJobManager::ensureDefaultJobs()` created missing jobs directly, triggered from `QueuedJobsAdmin`'s init hook.
 
-- `DefaultJobManager::ensureDefaultJobs()` **creates** missing jobs directly — it checks for an existing *active* (non-terminal: New/Init/Run/Wait/Paused) instance and, if none exists, queues a new one per `$default_schedule`.
-- `DefaultJobServiceExtension` calls that on `QueuedJobsAdmin::onBeforeInit()`.
-- `CheckDefaultJobsTask` both ensures and reports (`dry-run=1` reports only).
+That was a mistake, for two reasons discovered later:
 
-This does **not** touch `defaultJobs` config, so it coexists with the core mechanism rather than merging into it. The two are independent — a project can use either or both.
+1. **Core already does this.** `QueuedJobService::runQueue()` calls `checkDefaultJobs()` on *every* invocation, and `ProcessJobQueueTask` calls `runQueue()`. A plain YAML `defaultJobs` block is therefore re-checked on every cron tick — with alert emails (`EmailService::createMissingDefaultJobReport()`) and health-check integration that the bolt-on re-implementation did not have.
+2. **The trigger was unsound.** `Controller::doInit()` fires `onBeforeInit` *before* `$this->init()`, and `LeftAndMain`'s `canView()` check lives inside `init()` — so an unauthenticated request to `/admin/queuedjobs` ran the ensure logic (a potential write) before being redirected to login.
 
-This also sidesteps a self-rescheduling duplicate-signature bug seen elsewhere (a running job's signature matches its next scheduled run, so the duplicate check blocks rescheduling). By deduping on `Implementation` + active status rather than on job signatures, `DefaultJobManager` avoids the problem.
+The original merge-into-`defaultJobs` idea also turns out to be **impossible without overriding core**: `QueuedJobService::$defaultJobs` is a public property populated via Injector `properties:`, and neither `runQueue()` nor `checkDefaultJobs()` exposes an extension hook. (`QueuedJobService` *is* `Extensible`, but only around `queueJob` and the exception/completion paths.)
 
-### 4. `ScheduledMethodCall` and 5. `ClosureJob` (dispatch helpers)
+So 1.2.0 removed the extension and the creation logic entirely. `DefaultJobManager` is now discovery + diagnostics, and can emit the core `defaultJobs` YAML block for you to paste (`sake dev/tasks/check-default-jobs yaml=1`). You keep the co-location benefit while authoring; core keeps ownership of scheduling.
 
-Both remove the need to write a dedicated job class for small async work.
+### 4. `ScheduledMethodCall` (dispatch helper)
+
+Removes the need to write a dedicated job class for small async work.
 
 - **`ScheduledMethodCall`** — "call method X on object/class Y in the background." Clear and debuggable (the class, method and args are visible in the DB), and instance calls re-fetch the `DataObject` by ID at run time so no stale object is serialized.
-- **`ClosureJob`** — "run this inline logic in the background," for cases with no single named method.
 
-**The closure serialization problem.** PHP's native `serialize()` (used by QueuedJobs for saved job data) refuses to serialize closures. The fix: wrap the closure in a `SerializableClosure` and `serialize()` it to a plain string *before* it becomes job data, so the QueuedJobs serialization path only ever sees a string.
-
-Crucially, **no new dependency is added** — a closure-serialization library is already in the tree transitively (via `silverstripe/doorman`, which uses it for its own child-process `CallbackTask`). The module simply uses whichever is present.
-
-Guidance baked into the docs: **capture IDs, not objects.** Anything captured in a closure's `use()` is serialized at dispatch time; `DataObject`s should be re-fetched inside the closure body.
-
-Offering both `ScheduledMethodCall` and `ClosureJob` is deliberate — the former is clearer and more auditable for the common single-method case; the latter handles arbitrary multi-statement logic at the cost of an opaque serialized blob in the DB (mitigated by the required `description`).
+> **`ClosureJob` was removed in 1.2.0.** It queued an arbitrary closure by wrapping it in a
+> `SerializableClosure` and pre-serializing it to a string before it entered job data (PHP's native
+> `serialize()`, which QueuedJobs uses for saved job data, refuses to serialize closures).
+>
+> It was dropped because: nothing used it; it was the module's only dependency on the **abandoned**
+> `silverstripe/closure` (Opis) library, which emits deprecation notices on PHP 8.3; and it was a
+> blocker for SS6, which needs `laravel/serializable-closure` instead.
+>
+> The two jobs also differ semantically in a way that made merging them unattractive:
+> `ScheduledMethodCall` is **by reference** (stores class + ID, re-fetches fresh at run time) while
+> `ClosureJob` was **by value** (captured state frozen at dispatch). If it returns, a unified
+> `CallableJob` accepting `Closure | [$obj,'method'] | ['Class','method']` is the shape to aim for.
 
 ### 6. `CleanupBrokenJobsTask`
 

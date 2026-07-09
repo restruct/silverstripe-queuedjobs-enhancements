@@ -4,24 +4,13 @@ After:
   - '#queuedjobsettings'
 ---
 # ImmediateJobRunner: set true if inotifywait is running (uses IMMEDIATE queue instead of CLI spawn)
+#
+# NOTE: this also requires QueuedJobService.use_shutdown_function: false, otherwise no
+# trigger file is written and nothing can pick the job up sub-second. See the README.
 Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
   use_immediate_queue: false
 
-# Self-declaring default jobs: Extension on QueuedJobsAdmin ensures
-# jobs with $is_default_job = true are in the queue when admin visits.
-# For cron: add `sake dev/tasks/check-default-jobs` to crontab.
-Symbiote\QueuedJobs\Controllers\QueuedJobsAdmin:
-  extensions:
-    - Restruct\QueuedJobsEnhancements\Extensions\DefaultJobServiceExtension
-
-# Throttle for the above: the admin init hook fires on every request to the section
-# (including XHR), so the check is rate-limited rather than run every time. 0 = always.
-Restruct\QueuedJobsEnhancements\Extensions\DefaultJobServiceExtension:
-  check_interval: 300
-
-# Dedicated cache used by the throttle above.
-SilverStripe\Core\Injector\Injector:
-  Psr\SimpleCache\CacheInterface.queuedjobsEnhancements:
-    factory: SilverStripe\Core\Cache\CacheFactory
-    constructor:
-      namespace: 'queuedjobsEnhancements'
+# Self-declaring default jobs ($is_default_job = true) are DIAGNOSTIC ONLY — this module
+# does not create or schedule them. Core already does that: QueuedJobService::runQueue()
+# calls checkDefaultJobs() on every ProcessJobQueueTask run. Use
+# `sake dev/tasks/check-default-jobs yaml=1` to emit the core `defaultJobs` block to paste.
