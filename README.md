@@ -102,6 +102,10 @@ Polling stops automatically on terminal status. On a fetch error it backs off (i
 
 **Note:** polling runs in the current page context and does **not** survive page navigation or refresh. This is fine for single-page CMS actions (GridField buttons, modal dialogs) where the user stays on the page. Cross-page persistence (e.g. via `sessionStorage`) is future work.
 
+#### The client component: `client/js/job-progress.js`
+
+Vanilla JS, no framework dependency; works in both the CMS admin and frontend templates. Exposed via `extra.expose`, so once the module is installed and `?flush`ed the file is available under the exposed `_resources/` path for that vendor module. Include it on any page that renders `[data-job-id]` markup, or use `window.JobProgress` directly.
+
 ### 2. Immediate Job Execution
 
 Skip the cron wait — queue a job and trigger it to run immediately in a background CLI process.
@@ -189,21 +193,46 @@ class DataSyncJob extends AbstractQueuedJob implements QueuedJob
 
 This works **independently** of the core `defaultJobs` mechanism — the two coexist. `DefaultJobManager` creates jobs directly; it does not modify `defaultJobs` config.
 
+> **Do you actually need this?** Core already calls `QueuedJobService::checkDefaultJobs()` from
+> `runQueue()` — i.e. on *every* `ProcessJobQueueTask` run. So a plain YAML `defaultJobs` block is
+> already re-checked every cron tick, with **zero** extra setup, and it gets core's alert emails and
+> health-check integration for free. The only thing this feature buys you is co-locating the schedule
+> with the job class. It cannot feed into core's `defaultJobs` (that's a public property populated via
+> Injector `properties:`, and `runQueue()` exposes no extension hook), which is why it has to create
+> jobs itself — and why it needs its own trigger. If YAML is tolerable, prefer YAML.
+
 **Triggering:**
 
-- **Admin visits:** `DefaultJobServiceExtension` (applied to `QueuedJobsAdmin`) calls `DefaultJobManager::ensureDefaultJobs()` on `onBeforeInit()`, i.e. whenever someone opens the QueuedJobs admin.
+- **Admin visits:** `DefaultJobServiceExtension` (applied to `QueuedJobsAdmin`) calls
+  `DefaultJobManager::ensureDefaultJobs()` on `onAfterInit()`. It is permission-guarded
+  (`canView()`) and throttled to once per `check_interval` seconds (default 300).
 - **Cron:** run the `check-default-jobs` task on a schedule.
 - **Manual:** `sake dev/tasks/check-default-jobs`
 - **Dry run (report only, creates nothing):** `sake dev/tasks/check-default-jobs dry-run=1`
 
-**Cron setup (alongside the existing job runner):**
+```yaml
+# Throttle for the admin-visit trigger. 0 = check on every request.
+Restruct\QueuedJobsEnhancements\Extensions\DefaultJobServiceExtension:
+  check_interval: 300
+```
+
+**Optional cron (only if you don't want to rely on admin visits):**
 
 ```bash
 # Existing: process the job queue every minute
 * * * * * php /path/to/vendor/silverstripe/framework/cli-script.php dev/tasks/ProcessJobQueueTask queue=queued
 
-# New: ensure self-declaring default jobs exist
+# Optional: ensure self-declaring default jobs exist
 */5 * * * * php /path/to/vendor/silverstripe/framework/cli-script.php dev/tasks/check-default-jobs
+```
+
+#### The `check-default-jobs` task
+
+The trigger/diagnostic task for this feature. Without arguments it ensures missing default jobs are created and prints a per-job report (`OK (active)` / `CREATED` / `ERROR`). With `dry-run=1` it only reports the discovered jobs and their queue status, creating nothing.
+
+```bash
+sake dev/tasks/check-default-jobs           # ensure + report
+sake dev/tasks/check-default-jobs dry-run=1 # report only
 ```
 
 ### 4. ScheduledMethodCall
@@ -289,19 +318,6 @@ sake dev/tasks/cleanup-broken-jobs
 
 Only `Broken` jobs are removed; all other statuses are left untouched.
 
-### 7. CheckDefaultJobsTask
-
-The trigger/diagnostic task for [Self-Declaring Default Jobs](#3-self-declaring-default-jobs). Without arguments it ensures missing default jobs are created and prints a per-job report (`OK (active)` / `CREATED` / `ERROR`). With `dry-run=1` it only reports the discovered jobs and their queue status without creating anything.
-
-```bash
-sake dev/tasks/check-default-jobs           # ensure + report
-sake dev/tasks/check-default-jobs dry-run=1 # report only
-```
-
-### 8. `client/js/job-progress.js`
-
-The vanilla-JS polling component behind [Job Progress Tracking](#1-job-progress-tracking) — no framework dependency, works in both the CMS admin and frontend templates. Exposed via `extra.expose`, so once the module is installed and `?flush`ed the file is available under the exposed `_resources/` path for that vendor module. Include it on any page that renders `[data-job-id]` markup, or use `window.JobProgress` directly.
-
 ## Dev Tasks
 
 | Task | Segment | Description |
@@ -316,7 +332,7 @@ src/
 ├── Controllers/
 │   └── JobProgressController.php       # REST API for job progress
 ├── Extensions/
-│   └── DefaultJobServiceExtension.php  # Ensures default jobs on QueuedJobsAdmin visit
+│   └── DefaultJobServiceExtension.php  # Ensures default jobs on QueuedJobsAdmin visit (guarded + throttled)
 ├── Jobs/
 │   ├── ClosureJob.php                  # Queue closures
 │   └── ScheduledMethodCall.php         # Queue method calls
@@ -335,10 +351,10 @@ client/js/
 
 ```bash
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests/
-# expected: OK (32 tests, 75 assertions)
+# expected: OK (35 tests, 84 assertions)
 ```
 
-The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `ClosureJob` (including serialize→unserialize→process round-trip), `DefaultJobManager`, and `CleanupBrokenJobsTask`.
+The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `ClosureJob` (including serialize→unserialize→process round-trip), `DefaultJobManager`, `ImmediateJobRunner` (queue/`RunAsID` regression tests and the IMMEDIATE trigger-file contract), and `CleanupBrokenJobsTask`.
 
 > **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` — the tests follow this convention deliberately.
 
@@ -347,8 +363,8 @@ The suite covers the controller (auth/permission/response shape), `ScheduledMeth
 ## Design Principles
 
 1. **Never replace or subclass core QueuedJobs classes.** No custom `QueuedJobService`, no Injector overrides. Extensions where hooks exist, complementary services alongside.
-2. **Play well with existing infrastructure.** If `inotifywait` is set up, use the IMMEDIATE queue. If `defaultJobs` YAML exists, it keeps working. Respect the existing job runner.
-3. **CLI spawn over FPM tricks.** Background processes via `exec()` are more robust and portable than `fastcgi_finish_request()`.
+2. **Play well with existing infrastructure.** If `inotifywait` is set up, use the IMMEDIATE queue (note: `inotifywait` is not installed by default — it comes from the `inotify-tools` package). If `defaultJobs` YAML exists, it keeps working. Respect the existing job runner.
+3. **CLI spawn over FPM tricks.** Background processes via `exec()` are more robust and portable than `fastcgi_finish_request()`, and — unlike it — do not hold a PHP-FPM worker for the duration of the job.
 4. **Traits over base classes.** (Future: a `MultiStepJob` trait for sequential/parallel/dynamic step processing with flow control.)
 
 ## Migration from admintweaks
