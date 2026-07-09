@@ -4,6 +4,7 @@ namespace Restruct\QueuedJobsEnhancements\Services;
 
 use Psr\Log\LoggerInterface;
 use SilverStripe\Control\Director;
+use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Config\Configurable;
 use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\Core\Injector\Injector;
@@ -47,7 +48,29 @@ class ImmediateJobRunner
         # If inotifywait is set up, use IMMEDIATE queue — the existing
         # infrastructure handles sub-second execution already
         if (static::singleton()->config()->get('use_immediate_queue')) {
-            return $service->queueJob($job, $startAfter, QueuedJob::IMMEDIATE);
+            # queueJob() is ($job, $startAfter, $userId, $queueName) — the queue override is
+            # the FOURTH param. Passing it third assigned the queue constant to $userId, which
+            # (a) left JobType at $job->getJobType() so the IMMEDIATE override never applied, and
+            # (b) forced RunAsID to Member ID 1, bypassing the job's own getRunAsMemberID().
+            // return $service->queueJob($job, $startAfter, QueuedJob::IMMEDIATE);  // old: queue landed in $userId
+            $descriptorId = $service->queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE);
+
+            # The trigger file that inotifywait watches is only written when BOTH
+            # JobType === IMMEDIATE *and* QueuedJobService.use_shutdown_function is false
+            # (see QueuedJobDescriptor::activateOnQueue()). That config defaults to TRUE, so
+            # without this warning the job silently degrades to "picked up on the next cron
+            # tick" — slower than the CLI-spawn path this option replaced.
+            if (Config::inst()->get(QueuedJobService::class, 'use_shutdown_function')) {
+                static::log(sprintf(
+                    'use_immediate_queue is on, but QueuedJobService.use_shutdown_function is still true, '
+                    . 'so no trigger file was written for job #%d and no watcher can pick it up. '
+                    . 'Set use_shutdown_function: false and run an inotifywait watcher, '
+                    . 'or turn off use_immediate_queue to fall back to CLI spawn.',
+                    $descriptorId
+                ));
+            }
+
+            return $descriptorId;
         }
 
         # Queue normally first (safety net — cron picks it up if spawn fails)
@@ -86,8 +109,16 @@ class ImmediateJobRunner
         $phpBinary = PHP_BINARY ?: 'php';
 
         # Build command: nohup detaches from parent, /dev/null discards output, & runs in background
+        #
+        # The "queuedjob-" prefix is REQUIRED. ProcessJobQueueTask only enters single-job mode
+        # when the job param contains a dash — `if (($job = $request->getVar('job')) && strpos($job, '-'))`
+        # — taking the part after the dash as the descriptor ID. This matches the `queuedjob-{ID}`
+        # trigger-file names inotifywait passes as `%f`. A bare `job=42` fails that check and falls
+        # through to runQueue('Queued'), draining the ENTIRE queued queue instead of this one job
+        # (and missing the job entirely if it is a LARGE or IMMEDIATE job).
         $cmd = sprintf(
-            'nohup %s %s dev/tasks/ProcessJobQueueTask job=%d > /dev/null 2>&1 &',
+            // 'nohup %s %s dev/tasks/ProcessJobQueueTask job=%d > /dev/null 2>&1 &',  // old: bare ID, no dash
+            'nohup %s %s dev/tasks/ProcessJobQueueTask job=queuedjob-%d > /dev/null 2>&1 &',
             escapeshellarg($phpBinary),
             escapeshellarg($cliScript),
             $descriptorId

@@ -5,8 +5,8 @@
     "license": "MIT",
     "require": {
         "php": "^8.1",
-        "silverstripe/framework": "^5 || ^6",
-        "symbiote/silverstripe-queuedjobs": "^5 || ^6"
+        "silverstripe/framework": "^5",
+        "symbiote/silverstripe-queuedjobs": "^5"
     },
     "suggest": {
         "silverstripe/closure": "Required for ClosureJob on SS5 (installed via doorman)",

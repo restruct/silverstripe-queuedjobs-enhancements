@@ -13,3 +13,15 @@ Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
 Symbiote\QueuedJobs\Controllers\QueuedJobsAdmin:
   extensions:
     - Restruct\QueuedJobsEnhancements\Extensions\DefaultJobServiceExtension
+
+# Throttle for the above: the admin init hook fires on every request to the section
+# (including XHR), so the check is rate-limited rather than run every time. 0 = always.
+Restruct\QueuedJobsEnhancements\Extensions\DefaultJobServiceExtension:
+  check_interval: 300
+
+# Dedicated cache used by the throttle above.
+SilverStripe\Core\Injector\Injector:
+  Psr\SimpleCache\CacheInterface.queuedjobsEnhancements:
+    factory: SilverStripe\Core\Cache\CacheFactory
+    constructor:
+      namespace: 'queuedjobsEnhancements'

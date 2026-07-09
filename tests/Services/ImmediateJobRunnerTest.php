@@ -1,0 +1,112 @@
+<?php
+
+namespace Restruct\QueuedJobsEnhancements\Tests\Services;
+
+use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
+use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubNonDefaultJob;
+use SilverStripe\Core\Config\Config;
+use SilverStripe\Dev\SapphireTest;
+use SilverStripe\Security\Member;
+use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
+use Symbiote\QueuedJobs\Services\QueuedJob;
+use Symbiote\QueuedJobs\Services\QueuedJobService;
+
+/**
+ * Regression tests for the queueJob() argument-position bug.
+ *
+ * QueuedJobService::queueJob() is ($job, $startAfter, $userId, $queueName). Passing the
+ * queue constant as the 3rd argument silently assigned it to $userId, which both left
+ * JobType untouched and forced RunAsID to Member ID 1.
+ *
+ * Note: spawnJobProcess() early-returns under Director::is_cli(), so the CLI-spawn path
+ * never shells out during tests.
+ */
+class ImmediateJobRunnerTest extends SapphireTest
+{
+    protected $usesDatabase = true;
+
+    /**
+     * Create a member guaranteed not to be ID 1, so a clobbered RunAsID is detectable.
+     */
+    protected function createNonFirstMember(): Member
+    {
+        $filler = Member::create();
+        $filler->Email = 'filler@example.com';
+        $filler->write();
+
+        $member = Member::create();
+        $member->Email = 'runner@example.com';
+        $member->write();
+
+        return $member;
+    }
+
+    public function testImmediateQueueSetsJobTypeNotRunAsId(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', true);
+
+        $member = $this->createNonFirstMember();
+        $this->assertGreaterThan(1, (int) $member->ID, 'Test needs a member whose ID is not 1');
+        $this->logInAs($member);
+
+        $descriptorId = ImmediateJobRunner::queueAndRun(new StubNonDefaultJob());
+        $descriptor = QueuedJobDescriptor::get()->byID($descriptorId);
+        $this->assertNotNull($descriptor);
+
+        # The queue override must actually apply (4th param), not be swallowed as $userId
+        $this->assertEquals(
+            QueuedJob::IMMEDIATE,
+            $descriptor->JobType,
+            'use_immediate_queue must set JobType to IMMEDIATE'
+        );
+
+        # RunAsID must reflect the acting member, not be clobbered to the queue constant (1)
+        $this->assertEquals(
+            (int) $member->ID,
+            (int) $descriptor->RunAsID,
+            'RunAsID must not be overwritten by the queue constant'
+        );
+    }
+
+    public function testDefaultPathQueuesWithoutClobberingRunAsId(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', false);
+
+        $member = $this->createNonFirstMember();
+        $this->logInAs($member);
+
+        $descriptorId = ImmediateJobRunner::queueAndRun(new StubNonDefaultJob());
+        $descriptor = QueuedJobDescriptor::get()->byID($descriptorId);
+
+        $this->assertNotNull($descriptor);
+        $this->assertEquals((int) $member->ID, (int) $descriptor->RunAsID);
+        # StubNonDefaultJob::getJobType() returns QUEUED — no override in this path
+        $this->assertEquals(QueuedJob::QUEUED, $descriptor->JobType);
+    }
+
+    /**
+     * Guards the documented prerequisite for the inotify path: the trigger file that
+     * inotifywait watches is only written when JobType === IMMEDIATE *and*
+     * QueuedJobService.use_shutdown_function is false (QueuedJobDescriptor::activateOnQueue()).
+     */
+    public function testTriggerFileWrittenOnlyWhenShutdownFunctionDisabled(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', true);
+        Config::modify()->set(QueuedJobService::class, 'use_shutdown_function', false);
+
+        $descriptorId = ImmediateJobRunner::queueAndRun(new StubNonDefaultJob());
+        $descriptor = QueuedJobDescriptor::get()->byID($descriptorId);
+
+        $this->assertEquals(QueuedJob::IMMEDIATE, $descriptor->JobType);
+
+        $jobDir = Config::inst()->get(QueuedJobService::class, 'cache_dir');
+        if ($jobDir[0] !== '/') {
+            $jobDir = TEMP_FOLDER . '/' . $jobDir;
+        }
+
+        $this->assertFileExists(
+            $jobDir . '/queuedjob-' . $descriptorId,
+            'IMMEDIATE + use_shutdown_function:false must write the inotify trigger file'
+        );
+    }
+}

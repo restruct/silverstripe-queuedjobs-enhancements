@@ -7,13 +7,20 @@ Progress tracking, immediate execution, self-declaring default jobs, and consoli
 ## Requirements
 
 - PHP `^8.1`
-- `silverstripe/framework` `^5 || ^6`
-- `symbiote/silverstripe-queuedjobs` `^5 || ^6`
+- `silverstripe/framework` `^5`
+- `symbiote/silverstripe-queuedjobs` `^5`
 - For `ClosureJob` only: a closure-serialization library must be present —
-  `silverstripe/closure` on SS5 or `laravel/serializable-closure` on SS6. Both
-  are normally already in the dependency tree (pulled in transitively by
-  `silverstripe/doorman`), so no extra `require` is usually needed. See
-  [ClosureJob](#5-closurejob) for the SS5/SS6 import note.
+  `silverstripe/closure` on SS5. It is normally already in the dependency tree
+  (pulled in transitively by `silverstripe/doorman`), so no extra `require` is
+  usually needed. See [ClosureJob](#5-closurejob) for the SS6 import note.
+
+> **SS6 is not supported yet.** Earlier releases advertised `^6`, but the module cannot
+> boot on SS6: `SilverStripe\Dev\BuildTask` there extends `PolyCommand` with an
+> incompatible signature (`execute(InputInterface, PolyOutput): int`, plus a `static`
+> `$description`), so `CheckDefaultJobsTask` and `CleanupBrokenJobsTask` fatal on class
+> load. `cli-script.php` (used by `ImmediateJobRunner`) was also removed in SS6, and
+> `ClosureJob` needs `laravel/serializable-closure` instead of the abandoned Opis library.
+> The constraint is narrowed to `^5` until proper SS6 support is built.
 
 These are declared as `suggest` (not hard `require`) in `composer.json` because they only matter if you use `ClosureJob`.
 
@@ -114,7 +121,11 @@ $descriptorId = ImmediateJobRunner::queueAndRun($job);
 | 2 | `exec()` available and not running under CLI | Spawn a detached background PHP process for this specific job |
 | 3 | Fallback | Job stays queued; the normal cron runner handles it (typically within 60 s) |
 
-The background process is spawned as `nohup <PHP_BINARY> vendor/silverstripe/framework/cli-script.php dev/tasks/ProcessJobQueueTask job=<ID> > /dev/null 2>&1 &`. It uses `cli-script.php` directly (more reliable than `sake`) and `PHP_BINARY` (the exact binary running the current request). Spawn failures are logged as warnings and never break the request — the job remains safely queued. No `fastcgi_finish_request()` tricks and no core class replacement.
+The background process is spawned as `nohup <PHP_BINARY> vendor/silverstripe/framework/cli-script.php dev/tasks/ProcessJobQueueTask job=queuedjob-<ID> > /dev/null 2>&1 &`. It uses `cli-script.php` directly (more reliable than `sake`) and `PHP_BINARY` (the exact binary running the current request). Spawn failures are logged as warnings and never break the request — the job remains safely queued. No `fastcgi_finish_request()` tricks and no core class replacement.
+
+> **The `queuedjob-` prefix is mandatory.** `ProcessJobQueueTask` only enters single-job mode when the `job` parameter contains a dash. A bare `job=42` silently falls through to draining the entire *Queued* queue.
+
+Because the spawn is a separate CLI process, it does **not** occupy a PHP-FPM worker (that is the failure mode of `fastcgi_finish_request()`, which this module deliberately avoids). The real cost is that each dispatch bootstraps Silverstripe in a new process, and nothing caps how many run concurrently.
 
 **Configuration:**
 
@@ -123,6 +134,20 @@ The background process is spawned as `nohup <PHP_BINARY> vendor/silverstripe/fra
 Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
   use_immediate_queue: false
 ```
+
+> **`use_immediate_queue: true` has a prerequisite.** The trigger file that `inotifywait` watches is
+> only written when the job's `JobType` is `IMMEDIATE` **and** `QueuedJobService.use_shutdown_function`
+> is `false` (see `QueuedJobDescriptor::activateOnQueue()`). That setting defaults to `true`, so you must
+> also set:
+>
+> ```yaml
+> Symbiote\QueuedJobs\Services\QueuedJobService:
+>   use_shutdown_function: false
+> ```
+>
+> The module logs a warning if you enable `use_immediate_queue` without this. Note that disabling the
+> shutdown function also removes the behaviour where a CLI cron run drains the IMMEDIATE queue as it
+> exits — so keep a `queue=immediate` cron entry as a safety net if you rely on that.
 
 ### 3. Self-Declaring Default Jobs
 

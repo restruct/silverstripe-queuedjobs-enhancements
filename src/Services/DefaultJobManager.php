@@ -116,7 +116,11 @@ class DefaultJobManager
                 $queue = $config['jobType'] !== null ? (int) $config['jobType'] : null;
 
                 if ($queue !== null) {
-                    $service->queueJob($job, $startAfter, $queue);
+                    # queueJob() is ($job, $startAfter, $userId, $queueName) — the queue override is
+                    # the FOURTH param. Passing it third assigned the queue type to $userId, forcing
+                    # RunAsID to that integer (e.g. Member ID 2) and leaving JobType unchanged.
+                    // $service->queueJob($job, $startAfter, $queue);  // old: $queue landed in $userId
+                    $service->queueJob($job, $startAfter, null, $queue);
                 } else {
                     $service->queueJob($job, $startAfter);
                 }
