@@ -12,7 +12,7 @@ The design was driven by these local documents. **This module does not depend on
 
 **Plans**
 - `PLAN.md` (this repo) — the canonical, evolved plan actually followed (adds `_config/config.yml`, the CLI-spawn `ImmediateJobRunner`).
-- `~/.claude/plans/flickering-finding-sedgewick.md` — an earlier draft (used `fastcgi_finish_request()`, module at project root). **Since deleted**; fully superseded by `PLAN.md`.
+- `~/.claude/plans/flickering-finding-sedgewick.md` — an earlier draft (used `fastcgi_finish_request()`, module at project root). Deleted from its original location, but **recovered verbatim from the session transcript** and preserved in this repo as [../PLAN-original-draft.md](../PLAN-original-draft.md) (with a provenance header). Fully superseded by `PLAN.md`.
 
 **SSKB profiles that governed the workflow**
 - `silverstripe/profiles/local-module-dev.md` — the `_dev/` path-repository workflow (the fix for the double-scan bug below).
