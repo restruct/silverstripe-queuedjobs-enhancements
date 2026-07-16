@@ -189,6 +189,30 @@ class ScheduledMethodCallTest extends SapphireTest
     }
 
     /**
+     * Regression test for the 3.16.0 ID=0 constructor guard (parity port, 1.2.2): scheduling on
+     * an UNWRITTEN DataObject must throw immediately at construction. Without the guard, the
+     * falsy objectID=0 made process() silently degrade to a STATIC method call, fataling at cron
+     * time far from the cause (hit on a site in prod: scheduling from onBeforeWrite of an initial save).
+     */
+    public function testScheduleThrowsOnUnwrittenRecord(): void
+    {
+        # Unwritten — ID is 0
+        $descriptor = QueuedJobDescriptor::create();
+        $descriptor->JobTitle = 'Never written';
+        $this->assertEquals(0, (int) $descriptor->ID);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/UNWRITTEN record \(ID=0\).*write\(\) it first/');
+
+        new ScheduledMethodCall(
+            $descriptor,
+            'getTitle',
+            [],
+            ['description' => 'Schedule on unwritten record'],
+        );
+    }
+
+    /**
      * Regression test for the 3.16.0 fail-fast port: a record deleted between scheduling and
      * execution must throw a clear RuntimeException — not a property-set on null (an Error the
      * old catch then swallowed, feeding the same infinite-loop failure mode as above).

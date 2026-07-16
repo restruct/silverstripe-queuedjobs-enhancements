@@ -92,6 +92,18 @@ class ScheduledMethodCall extends AbstractQueuedJob
         if ($objectOrClass && $method) {
             # Store object reference — DataObjects by ID+class, others by class name
             if ($objectOrClass instanceof DataObject) {
+                # Fail FAST on an unwritten record (ported from admintweaks 3.16.0). With ID=0 the
+                # stored objectID is falsy, so process() would silently degrade to a STATIC call and
+                # fatal at cron time ("method cannot be called statically") — far from the actual
+                # cause. Hit on a site in prod: a record scheduled a method on itself from onBeforeWrite
+                # of its INITIAL save.
+                if (!$objectOrClass->ID) {
+                    throw new \InvalidArgumentException(sprintf(
+                        'ScheduledMethodCall: cannot schedule %s::%s() on an UNWRITTEN record (ID=0) — write() it first (or schedule from onAfterWrite)',
+                        $objectOrClass->ClassName,
+                        $method
+                    ));
+                }
                 $this->objectID = $objectOrClass->ID;
                 $this->objectClass = $objectOrClass->ClassName;
             } elseif (is_object($objectOrClass)) {
@@ -124,11 +136,17 @@ class ScheduledMethodCall extends AbstractQueuedJob
 
     public function getTitle(): string
     {
+        # Intentional divergence from admintweaks (`return $this->description;`): our typed
+        # `: string` return would TypeError on the empty/deserialization path, so a fallback is
+        # required. Equivalent in practice — the constructor always sets at least '[ no description ]'.
         return $this->description ?: 'ScheduledMethodCall';
     }
 
     public function getJobType(): int
     {
+        # Intentional divergence from admintweaks (`return $this->jobType;`): int cast + QUEUED
+        # fallback for the typed signature. Equivalent — QueuedJob constants are numeric strings
+        # ('1'/'2'/'3') and every consumer compares loosely (e.g. JobType == QueuedJob::IMMEDIATE).
         return (int) ($this->jobType ?: QueuedJob::QUEUED);
     }
 
@@ -208,8 +226,11 @@ class ScheduledMethodCall extends AbstractQueuedJob
         );
     }
 
-    protected function randomSignature(): string
-    {
-        return '_' . substr(md5(uniqid('', true)), 0, 8);
-    }
+    # Removed for 1:1 admintweaks parity (1.2.2): the parent AbstractQueuedJob::randomSignature()
+    # (md5(class . timestamp . mt_rand)) is what the admintweaks copy uses for ignoreIdentical.
+    # Both are random-enough; keeping our own override was an undocumented divergence.
+    //    protected function randomSignature(): string
+    //    {
+    //        return '_' . substr(md5(uniqid('', true)), 0, 8);
+    //    }
 }
