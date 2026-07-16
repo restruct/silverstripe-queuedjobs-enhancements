@@ -2,7 +2,7 @@
 
 Progress tracking, immediate execution, and consolidation utilities for [symbiote/silverstripe-queuedjobs](https://github.com/symbiote/silverstripe-queuedjobs).
 
-`symbiote/silverstripe-queuedjobs` is solid for background processing, but the developer and end-user experience around it has some rough edges: a queued job gives no live feedback (the browser only learns it finished on the next page reload), jobs wait for the next cron tick before they start, and there is no first-class way to queue a one-off method call. This module adds those pieces as small, independent components that sit **alongside** the core module — it never replaces or subclasses core QueuedJobs classes.
+`symbiote/silverstripe-queuedjobs` is solid for background processing, but the developer and end-user experience around it has some rough edges: a queued job gives no live feedback (the browser only learns it finished on the next page reload), jobs wait for the next cron tick before they start, and there is no first-class way to queue a one-off method call or send a composed Email asynchronously. This module adds those pieces as small, independent components that sit **alongside** the core module — it never replaces or subclasses core QueuedJobs classes.
 
 ## Requirements
 
@@ -233,6 +233,8 @@ ScheduledMethodCall::schedule($myObject, 'archive', [], [], '+1 hour');
 
 For instance calls, the running job instance is exposed to the target object as `$object->scheduled_job_instance`, so the called method can add job messages, advance steps, etc. If the method throws, the job is marked `Broken` with the exception detail added as a message.
 
+> **For Emails, use [SendEmailJob](#5-sendemailjob) — ScheduledMethodCall cannot carry them.** An `Email` is not a `DataObject`: this job persists class+ID and re-fetches, so a composed Email cannot ride along (the naive attempt ends up calling `Email::send()` statically on an empty singleton).
+
 **Options (4th argument):**
 
 | Option | Default | Description |
@@ -242,7 +244,38 @@ For instance calls, the running job instance is exposed to the target object as 
 | `totalSteps` | `1` | Total steps (for multi-step processing) |
 | `ignoreIdentical` | `false` | When `true`, appends a random signature so identical jobs can coexist in the queue |
 
-### 5. CleanupBrokenJobsTask
+### 5. SendEmailJob
+
+Send a composed `Email` asynchronously. This is the counterpart to [ScheduledMethodCall](#4-scheduledmethodcall) for the one thing it structurally cannot do: an `Email` is not a `DataObject`, so it can't be persisted as class+ID and re-fetched. `SendEmailJob` instead serialises the email's parts into `jobData` via `hydrate()` and rebuilds a fresh `Email` in `process()`.
+
+```php
+use Restruct\QueuedJobsEnhancements\Jobs\SendEmailJob;
+use SilverStripe\Control\Email\Email;
+use Symbiote\QueuedJobs\Services\QueuedJobService;
+
+$email = Email::create()
+    ->setTo(['user@example.com' => 'User Name'])
+    ->setFrom(['noreply@example.com' => 'My Site'])
+    ->setSubject('Your request was received')
+    ->setBody($htmlBody);
+
+$job = new SendEmailJob();
+$job->hydrate($email);          // serialise To/From/Subject/HTML body/CC/BCC/Reply-To into jobData
+QueuedJobService::singleton()->queueJob($job);
+// ...cron (or ImmediateJobRunner::queueAndRun($job)) rebuilds and sends it
+```
+
+The implementation embodies three hard-won SS5/Symfony traps — each broke production at some point, and each is comment-documented in the class:
+
+1. Addresses are stored as `[email => name]` maps — `getTo()` returns Symfony `Address` *objects*, and feeding those back into `setTo()` double-wraps them (`new Address($addressObject)` → TypeError).
+2. The body is read via `getHtmlBody()` — the assembled `getBody()` returns a Symfony `TextPart` that is **not** string-castable.
+3. Reply-to uses `setReplyTo(string $address, string $name)` (not a map), unpacked from a **local copy** of the jobData property — `reset()` on the overloaded magic property raises "Indirect modification of overloaded property".
+
+> **Limitation:** the round-trip carries **To / From / Subject / HTML body / CC / BCC / Reply-To only** — **no attachments and no custom headers**. That's fine for notification mail; do not assume full `Email` fidelity.
+
+A job whose recipient data was lost completes gracefully with a "skipping" message rather than breaking the queue runner.
+
+### 6. CleanupBrokenJobsTask
 
 Delete every queued job whose status is `Broken`:
 
@@ -266,7 +299,8 @@ src/
 ├── Controllers/
 │   └── JobProgressController.php       # REST API for job progress
 ├── Jobs/
-│   └── ScheduledMethodCall.php         # Queue method calls
+│   ├── ScheduledMethodCall.php         # Queue method calls
+│   └── SendEmailJob.php                # Send a composed Email asynchronously
 ├── Services/
 │   ├── DefaultJobManager.php           # Default-job discovery + diagnostics + YAML emitter
 │   └── ImmediateJobRunner.php          # CLI spawn (flock-serialised) for immediate execution
@@ -282,7 +316,7 @@ client/js/
 
 ```bash
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests/
-# expected: OK (35 tests, 84 assertions)
+# expected: OK (40 tests, 108 assertions)
 ```
 
 The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, the `queuedjob-` spawn contract, `flock` wrapping, and the IMMEDIATE trigger-file contract), and `CleanupBrokenJobsTask`.
