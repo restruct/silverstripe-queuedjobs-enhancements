@@ -155,7 +155,14 @@ class ScheduledMethodCallTest extends SapphireTest
         $this->assertEquals($job1->getSignature(), $job2->getSignature());
     }
 
-    public function testProcessHandlesException(): void
+    /**
+     * Regression test for the 3.15.0 rethrow port: an exception from the called method must
+     * PROPAGATE out of process(). The old code swallowed it and set `$this->jobStatus` — a
+     * magic-jobData no-op QueuedJobService never reads, so the runner looped process()
+     * indefinitely, re-serialising the growing message log every pass (the step-2563 /
+     * 400MB OOM). Throwing lets runJob() mark the descriptor Broken properly.
+     */
+    public function testProcessRethrowsException(): void
     {
         $job = new ScheduledMethodCall(
             ScheduledMethodCallTestHelper::class,
@@ -165,10 +172,50 @@ class ScheduledMethodCallTest extends SapphireTest
         );
 
         $job->setup();
-        $job->process();
 
-        # Job should be broken after exception
+        try {
+            $job->process();
+            $this->fail('process() must rethrow the exception from the called method');
+        } catch (\RuntimeException $e) {
+            $this->assertEquals('Test exception', $e->getMessage());
+        }
+
+        # The error context message must still be recorded before the rethrow
+        $messages = $job->getJobData()->messages;
+        $this->assertNotEmpty($messages);
+        $this->assertStringContainsString('throwingMethod ERROR', (string) end($messages));
+
         $this->assertFalse($job->jobFinished());
+    }
+
+    /**
+     * Regression test for the 3.16.0 fail-fast port: a record deleted between scheduling and
+     * execution must throw a clear RuntimeException — not a property-set on null (an Error the
+     * old catch then swallowed, feeding the same infinite-loop failure mode as above).
+     */
+    public function testProcessFailsFastOnDeletedRecord(): void
+    {
+        # Create a real DataObject, schedule against it, then delete it
+        $descriptor = QueuedJobDescriptor::create();
+        $descriptor->JobTitle = 'Doomed target';
+        $descriptor->Implementation = 'DummyImpl';
+        $descriptor->JobStatus = QueuedJob::STATUS_NEW;
+        $descriptor->write();
+
+        $job = new ScheduledMethodCall(
+            $descriptor,
+            'getTitle',
+            [],
+            ['description' => 'Call on deleted record'],
+        );
+
+        $descriptor->delete();
+
+        $job->setup();
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessageMatches('/no longer exists.*record deleted since scheduling/');
+        $job->process();
     }
 }
 

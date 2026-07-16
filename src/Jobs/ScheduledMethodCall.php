@@ -144,6 +144,17 @@ class ScheduledMethodCall extends AbstractQueuedJob
         $objectOrClassName = $this->objectClass;
         if ($this->objectID) {
             $objectOrClassName = DataObject::get_by_id($this->objectClass, $this->objectID);
+            # Fail fast when the record was deleted between scheduling and execution (ported from
+            # admintweaks 3.16.0). A property-set on null would raise an Error that the old catch
+            # below swallowed — throwing here gives the service a clear, attributable Broken message.
+            if (!$objectOrClassName) {
+                throw new \RuntimeException(sprintf(
+                    'ScheduledMethodCall: %s #%d no longer exists — cannot call %s() (record deleted since scheduling?)',
+                    $this->objectClass,
+                    $this->objectID,
+                    $this->method
+                ));
+            }
             # Expose job instance to the called method (allows it to add messages, etc.)
             $objectOrClassName->scheduled_job_instance = $this;
         }
@@ -167,8 +178,17 @@ class ScheduledMethodCall extends AbstractQueuedJob
                 $e->getCode(),
                 $e->getMessage()
             ));
-            $this->jobStatus = QueuedJob::STATUS_BROKEN;
-            return;
+            # RE-THROW instead of `$this->jobStatus = STATUS_BROKEN; return;` (ported from
+            # admintweaks 3.15.0). That assignment only wrote a magic jobData property that
+            # QueuedJobService never reads — the service saw no exception and no isComplete, so it
+            # looped process() indefinitely with addMessage() re-serialised onto the descriptor
+            # every pass (a site in prod, 2026-07-15: descriptor #152177 reached step 2563/1 and OOM'd
+            # the runner at ~400MB). Throwing is the documented failure signal: runJob() catches
+            # Throwable, logs it against the descriptor and calls markJobAsBroken() (verified
+            # QueuedJobService::runJob() L928-933, queuedjobs 5.3.3).
+            //            $this->jobStatus = QueuedJob::STATUS_BROKEN;
+            //            return;
+            throw $e;
         }
 
 //        $this->addMessage('Called: ' . $this->getContextDescription());
