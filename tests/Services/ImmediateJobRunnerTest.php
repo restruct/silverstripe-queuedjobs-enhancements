@@ -111,6 +111,23 @@ class ImmediateJobRunnerTest extends SapphireTest
         $this->assertStringContainsString('> /dev/null 2>&1 &', $cmd);
     }
 
+    public function testSpawnCommandNeverUsesTheFpmBinary(): void
+    {
+        # PHP_BINARY under fpm-fcgi is the FPM daemon (/usr/sbin/php-fpmX.Y) — spawning with it
+        # was a silent no-op (prints usage into /dev/null; a site in prod, 2026-07-19). The command
+        # must resolve a real CLI binary. (Test runs under cli, where PHP_BINARY IS valid — the
+        # resolver must return it here, and must never emit an fpm daemon path anywhere.)
+        Config::modify()->set(ImmediateJobRunner::class, 'use_spawn_lock', false);
+
+        $cmd = $this->buildSpawnCommand(123);
+        $this->assertStringNotContainsString('php-fpm', $cmd);
+
+        $method = new \ReflectionMethod(ImmediateJobRunner::class, 'resolveCliPhpBinary');
+        $method->setAccessible(true);
+        $binary = $method->invoke(null);
+        $this->assertSame(PHP_BINARY, $binary, 'under the cli SAPI the current binary is the right answer');
+    }
+
     /**
      * Covers the lock wrapping on every platform by stubbing the binary lookup —
      * macOS has no util-linux `flock`, so relying on the real binary would silently

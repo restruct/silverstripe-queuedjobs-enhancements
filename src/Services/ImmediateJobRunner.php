@@ -146,8 +146,13 @@ class ImmediateJobRunner
             return null;
         }
 
-        # Find the PHP binary — use PHP_BINARY which gives us the exact binary running the current request
-        $phpBinary = PHP_BINARY ?: 'php';
+        # Find the CLI PHP binary. PHP_BINARY is only usable when we ARE the cli SAPI — under
+        # php-fpm it points at the FPM daemon binary (/usr/sbin/php-fpmX.Y), which just prints
+        # usage when handed a script and made every spawn a silent no-op (jobs sat New until the
+        # cron runner picked them up; found on a site in prod 2026-07-19). Resolve a real CLI
+        # binary instead, preferring the exact same PHP version.
+        //        $phpBinary = PHP_BINARY ?: 'php';
+        $phpBinary = static::resolveCliPhpBinary();
 
         # The "queuedjob-" prefix is REQUIRED. ProcessJobQueueTask only enters single-job mode
         # when the job param contains a dash — `if (($job = $request->getVar('job')) && strpos($job, '-'))`
@@ -172,6 +177,28 @@ class ImmediateJobRunner
         # nohup detaches from the parent, /dev/null discards output (without the redirect
         # PHP's exec() blocks until stdout closes), & backgrounds it.
         return sprintf('nohup %s > /dev/null 2>&1 &', $inner);
+    }
+
+    /**
+     * Resolve a CLI php binary usable for spawning (see buildSpawnCommand — PHP_BINARY is the
+     * FPM daemon under fpm-fcgi). Preference order: our own binary when we are cli(-server),
+     * then version-exact `phpX.Y` next to it / in PHP_BINDIR (Debian/Ubuntu layout), then the
+     * generic `php` in PHP_BINDIR, then bare `php` from PATH as a last resort.
+     */
+    protected static function resolveCliPhpBinary(): string
+    {
+        if (in_array(PHP_SAPI, ['cli', 'cli-server'], true) && PHP_BINARY) {
+            return PHP_BINARY;
+        }
+        $versioned = sprintf('php%d.%d', PHP_MAJOR_VERSION, PHP_MINOR_VERSION);
+        foreach ([PHP_BINDIR . '/' . $versioned, '/usr/bin/' . $versioned, PHP_BINDIR . '/php', '/usr/bin/php'] as $candidate) {
+            if (@is_executable($candidate)) {
+                return $candidate;
+            }
+        }
+        static::log('No CLI php binary found next to PHP_BINDIR; spawning with bare "php" from PATH.');
+
+        return 'php';
     }
 
     /**
