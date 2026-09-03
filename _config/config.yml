@@ -14,3 +14,19 @@ Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
 # does not create or schedule them. Core already does that: QueuedJobService::runQueue()
 # calls checkDefaultJobs() on every ProcessJobQueueTask run. Use
 # `sake dev/tasks/check-default-jobs yaml=1` to emit the core `defaultJobs` block to paste.
+
+# Concurrency guard (OPT-IN, per project): swap the queued-jobs service for the module's
+# subclass to enforce `private static bool $prevent_concurrent_runs = true` on job classes
+# (a second descriptor of such a job gets DEFERRED while one is active, closing the
+# cross-process duplicate-writes window). The module deliberately does NOT register this
+# swap — enable it in YOUR project config:
+#
+# SilverStripe\Core\Injector\Injector:
+#   Symbiote\QueuedJobs\Services\QueuedJobService:
+#     class: Restruct\QueuedJobsEnhancements\Services\EnhancedQueuedJobService
+#
+# Already running your own QueuedJobService subclass? Add `use ConcurrencyGuardedMutex;`
+# to it instead of swapping. Tunables (defer_seconds) live on ConcurrencyGuard:
+#
+# Restruct\QueuedJobsEnhancements\Services\ConcurrencyGuard:
+#   defer_seconds: 300

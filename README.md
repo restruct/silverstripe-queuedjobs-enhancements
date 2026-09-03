@@ -285,6 +285,55 @@ sake dev/tasks/cleanup-broken-jobs
 
 Only `Broken` jobs are removed; all other statuses are left untouched.
 
+### 7. Concurrency Guard (`$prevent_concurrent_runs`)
+
+Symbiote's own `grabMutex()` is strictly per-DESCRIPTOR: it stops the *same* descriptor
+running twice, but two scheduled descriptors of the same job class happily run concurrently
+in separate DB sessions (typical trigger: a slow recurring job overlapping its own next
+scheduled run). For jobs that write shared data, that overlap is a duplicate-writes window.
+
+Opt a job class in:
+
+```php
+class MySlowSyncJob extends AbstractQueuedJob implements QueuedJob
+{
+    private static bool $prevent_concurrent_runs = true;
+}
+```
+
+…and enable the service swap **per project** (the module deliberately does not register it):
+
+```yaml
+SilverStripe\Core\Injector\Injector:
+  Symbiote\QueuedJobs\Services\QueuedJobService:
+    class: Restruct\QueuedJobsEnhancements\Services\EnhancedQueuedJobService
+```
+
+An existing `properties:` block (defaultJobs etc.) on that injector key keeps applying —
+`class:` and `properties:` merge into the one spec.
+
+When a guarded job's descriptor is about to start while ANOTHER descriptor of the same
+`Implementation` is active (`Initialising`/`Running`/`Waiting`, or holding a committed
+`Worker` claim), it is **deferred**: its claim is released and `StartAfter` is pushed
+forward (`ConcurrencyGuard.defer_seconds`, default 300). No job lifecycle fires for a
+deferred run — no `setup()`, no `afterComplete()`, no mails — it simply starts once the
+active run has finished. `Waiting` (memory/time-parked) siblings deliberately count as
+active: a parked job is half-done and about to resume in a fresh process.
+
+**Race-safety (claim-then-verify):** the guard piggybacks on `grabMutex()` — each contender
+first COMMITS its own per-descriptor Worker-token claim, then verifies for active siblings.
+Two contenders can therefore never both proceed (each would have to verify before the
+other's committed claim); worst case both back off and the next runner tick resolves it.
+This also covers every start path — new jobs, `Waiting` resumes, stall restarts — and both
+engines (`QueueRunner` in-process, `DoormanRunner` via its child task), since all of them
+funnel through `QueuedJobService::runJob()` → `grabMutex()`.
+
+**Already running your own `QueuedJobService` subclass?** PHP's single inheritance means two
+subclasses can't be merged — instead add `use ConcurrencyGuardedMutex;` to your subclass (the
+trait carries the whole override; all tunables live on `ConcurrencyGuard`, a real class,
+because config declared on a trait does not merge), or call `ConcurrencyGuard` yourself from
+your own `grabMutex()`.
+
 ## Dev Tasks
 
 | Task | Segment | Description |
@@ -302,7 +351,10 @@ src/
 │   ├── ScheduledMethodCall.php         # Queue method calls
 │   └── SendEmailJob.php                # Send a composed Email asynchronously
 ├── Services/
+│   ├── ConcurrencyGuard.php            # Per-job-class concurrency decision logic + tunables
+│   ├── ConcurrencyGuardedMutex.php     # grabMutex() claim-then-verify override (trait)
 │   ├── DefaultJobManager.php           # Default-job discovery + diagnostics + YAML emitter
+│   ├── EnhancedQueuedJobService.php    # The single opt-in Injector swap target
 │   └── ImmediateJobRunner.php          # CLI spawn (flock-serialised) for immediate execution
 └── Tasks/
     ├── CheckDefaultJobsTask.php        # Report default jobs / emit defaultJobs YAML
@@ -316,10 +368,10 @@ client/js/
 
 ```bash
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests/
-# expected: OK (40 tests, 108 assertions)
+# expected: OK (49 tests, 125 assertions)
 ```
 
-The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, the `queuedjob-` spawn contract, `flock` wrapping, and the IMMEDIATE trigger-file contract), and `CleanupBrokenJobsTask`.
+The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, the `queuedjob-` spawn contract, `flock` wrapping, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 
 The `flock` tests stub the binary lookup, so the lock-wrapping and no-flock branches are both exercised on macOS *and* Linux rather than being skipped on whichever platform lacks `flock`.
 
@@ -329,7 +381,7 @@ The `flock` tests stub the binary lookup, so the lock-wrapping and no-flock bran
 
 ## Design Principles
 
-1. **Never replace or subclass core QueuedJobs classes.** No custom `QueuedJobService`, no Injector overrides. Extensions where hooks exist, complementary services alongside.
+1. **Never replace or subclass core QueuedJobs classes — unless there is no hook, and then only opt-in.** Extensions where hooks exist, complementary services alongside. The one exception is `EnhancedQueuedJobService` (concurrency guard): `QueuedJobService` exposes no extension point at job selection or `grabMutex()`, so a subclass is the only non-fork option — it overrides that single method, is inert unless a job opts in, and the Injector swap is never registered by the module itself (each project enables it explicitly).
 2. **Play well with existing infrastructure.** If `inotifywait` is set up, use the IMMEDIATE queue (note: `inotifywait` is not installed by default — it comes from the `inotify-tools` package). If `defaultJobs` YAML exists, it keeps working. Respect the existing job runner.
 3. **CLI spawn over FPM tricks.** Background processes via `exec()` are more robust and portable than `fastcgi_finish_request()`, and — unlike it — do not hold a PHP-FPM worker for the duration of the job.
 4. **Traits over base classes.** (Future: a `MultiStepJob` trait for sequential/parallel/dynamic step processing with flow control.)
