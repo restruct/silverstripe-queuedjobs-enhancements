@@ -6,16 +6,20 @@ Progress tracking, immediate execution, and consolidation utilities for [symbiot
 
 ## Requirements
 
-- PHP `^8.1`
-- `silverstripe/framework` `^5`
-- `symbiote/silverstripe-queuedjobs` `^5`
+- PHP `^8.1` (Silverstripe 6 itself needs 8.3)
+- `silverstripe/framework` `^5.4 || ^6`
+- `symbiote/silverstripe-queuedjobs` `^5 || ^6`
 
-> **SS6 is not supported yet.** Earlier releases advertised `^6`, but the module cannot
-> boot on SS6: `SilverStripe\Dev\BuildTask` there extends `PolyCommand` with an
-> incompatible signature (`execute(InputInterface, PolyOutput): int`, plus a `static`
-> `$description`), so `CheckDefaultJobsTask` and `CleanupBrokenJobsTask` fatal on class
-> load. `cli-script.php` (used by `ImmediateJobRunner`) was also removed in SS6.
-> The constraint is narrowed to `^5` until proper SS6 support is built.
+`composer.json` is the source of truth. One code line serves both majors:
+
+| Branch | Module version | Silverstripe | queuedjobs | PHP |
+|---|---|---|---|---|
+| `ss6` (unreleased) | next | 5.4+ and 6 | 5 and 6 | 8.1+ (SS5), 8.3+ (SS6) |
+| `main` | 1.x up to 1.4.0 | 5 only | 5 | 8.1+ |
+
+Where the two majors differ, the module detects which one is installed and does the right thing:
+the dev tasks have a separate entry point per major (see `src/Tasks/*EntryPoint.php`), and the
+CLI spawn runs `cli-script.php` on Silverstripe 5 and `bin/sake` on Silverstripe 6.
 
 ## Installation
 
@@ -23,16 +27,19 @@ Progress tracking, immediate execution, and consolidation utilities for [symbiot
 composer require restruct/silverstripe-queuedjobs-enhancements
 ```
 
-Then flush the manifest — visit any URL with `?flush=1`, or:
+Then flush the manifest - visit any URL with `?flush=1`, or:
 
 ```bash
+# Silverstripe 5
 php vendor/silverstripe/framework/cli-script.php dev/build flush=1
+# Silverstripe 6
+vendor/bin/sake db:build --flush
 ```
 
 The module registers:
 
 - A route `api/job-progress//$ID` → `JobProgressController` (via `_config/routes.yml`).
-- Two dev tasks: `check-default-jobs` and `cleanup-broken-jobs`.
+- Two dev tasks: `check-default-jobs` and `cleanup-broken-jobs` (`dev/tasks/<name>` on Silverstripe 5, `sake tasks:<name>` on Silverstripe 6).
 - Exposes `client/` (for `client/js/job-progress.js`) via `extra.expose` in `composer.json`.
 
 It registers no extensions and adds no runtime hooks — nothing runs unless you call it.
@@ -109,8 +116,12 @@ Skip the cron wait — queue a job and trigger it to run immediately in a backgr
 use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
 
 $descriptorId = ImmediateJobRunner::queueAndRun($job);
-// optional second arg: $startAfter (Rfc2822 datetime string)
+// optional second arg: $startAfter (a datetime string, e.g. 'Y-m-d H:i:s')
 ```
+
+A `$startAfter` in the future queues the job but does **not** spawn a process for it: the job is
+left to the queue runner, which starts it once that time has passed. (Up to 1.4.0 it was spawned
+anyway, and the spawned process ran it at once, ignoring the start time.)
 
 **How it works** — the job is *always* queued first (a safety net: if the spawn fails, cron still picks it up), then execution is triggered according to this detection order:
 
@@ -120,7 +131,29 @@ $descriptorId = ImmediateJobRunner::queueAndRun($job);
 | 2 | `exec()` available and not running under CLI | Spawn a detached background PHP process for this specific job |
 | 3 | Fallback | Job stays queued; the normal cron runner handles it (typically within 60 s) |
 
-The background process is spawned as `nohup <PHP_BINARY> vendor/silverstripe/framework/cli-script.php dev/tasks/ProcessJobQueueTask job=queuedjob-<ID> > /dev/null 2>&1 &`. It uses `cli-script.php` directly (more reliable than `sake`) and `PHP_BINARY` (the exact binary running the current request). Spawn failures are logged as warnings and never break the request — the job remains safely queued. No `fastcgi_finish_request()` tricks and no core class replacement.
+The background process is spawned as:
+
+```bash
+# Silverstripe 5
+nohup <php> vendor/silverstripe/framework/cli-script.php dev/tasks/ProcessJobQueueTask job=queuedjob-<ID> > /dev/null 2>&1 &
+# Silverstripe 6 (cli-script.php no longer exists; sake is a PHP script there)
+nohup <php> vendor/silverstripe/framework/bin/sake tasks:ProcessJobQueueTask --job=queuedjob-<ID> > /dev/null 2>&1 &
+```
+
+`<php>` is a real CLI binary: `PHP_BINARY` when the caller is itself CLI, otherwise the
+version-matched `phpX.Y` (or `php`) next to `PHP_BINDIR`, because under PHP-FPM `PHP_BINARY` is
+the FPM daemon, which cannot run a script. Spawn failures are logged as warnings and never break
+the request - the job remains safely queued. No `fastcgi_finish_request()` tricks and no core
+class replacement.
+
+> **The spawned process also runs the whole IMMEDIATE queue as it exits.** Every CLI process that
+> creates `QueuedJobService` registers its shutdown handler (`use_shutdown_function`, default
+> `true`), so a spawn started for one job also runs every due `IMMEDIATE` job before it exits.
+> On queuedjobs 5.x that drain ignores the maintenance lock: a spawn during maintenance runs
+> IMMEDIATE jobs even though its own job is held back (fixed upstream in queuedjobs 6.2.2).
+> To stop both, set `QueuedJobService.use_shutdown_function: false` and run the immediate queue
+> from its own cron (`queue=immediate`), which upstream recommends anyway and plans to require
+> (symbiote/silverstripe-queuedjobs#506).
 
 > **The `queuedjob-` prefix is mandatory.** `ProcessJobQueueTask` only enters single-job mode when the `job` parameter contains a dash. A bare `job=42` silently falls through to draining the entire *Queued* queue.
 
@@ -139,8 +172,8 @@ Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
 
   # Serialise spawned runners so a burst cannot fork unbounded PHP processes.
   use_spawn_lock: true
-  # Relative paths resolve under TEMP_FOLDER. Pin an absolute path if you want the
-  # lock shared across deployments (TEMP_FOLDER is derived from BASE_PATH, which
+  # Relative paths resolve under TEMP_PATH. Pin an absolute path if you want the
+  # lock shared across deployments (TEMP_PATH is derived from BASE_PATH, which
   # changes per release on zero-downtime deploys).
   spawn_lock_file: 'queuedjobs-enhancements-spawn.lock'
   # Seconds to wait for the lock before giving up (job stays queued). 0 = fail fast (flock -n).
@@ -184,7 +217,7 @@ class DataSyncJob extends AbstractQueuedJob implements QueuedJob
     private static string $default_schedule = '+5 minutes';
 
     // Optional:
-    private static int $default_job_type = QueuedJob::QUEUED; // adds `jobType` to the emitted config
+    private static string $default_job_type = QueuedJob::QUEUED; // adds `jobType` to the emitted config
     private static array $default_construct = [];             // constructor args
 }
 ```
@@ -194,13 +227,15 @@ class DataSyncJob extends AbstractQueuedJob implements QueuedJob
 **Report what's declared and whether it's queued:**
 
 ```bash
-sake dev/tasks/check-default-jobs
+sake dev/tasks/check-default-jobs     # Silverstripe 5
+sake tasks:check-default-jobs         # Silverstripe 6
 ```
 
 **Generate the core `defaultJobs` YAML to paste into your project config:**
 
 ```bash
-sake dev/tasks/check-default-jobs yaml=1
+sake dev/tasks/check-default-jobs yaml=1    # Silverstripe 5
+sake tasks:check-default-jobs --yaml        # Silverstripe 6
 ```
 
 That emits exactly the structure core's `checkDefaultJobs()` expects (`type`, `filter`, `recreate`, `construct`, `startDateFormat`, `startTimeString`, and `jobType` when `$default_job_type` is set). Paste it into e.g. `app/_config/queuedjobs.yml` and core takes over — creation, alert emails, health checks. You get the co-location benefit while authoring, without a second runtime mechanism to maintain.
@@ -280,7 +315,8 @@ A job whose recipient data was lost completes gracefully with a "skipping" messa
 Delete every queued job whose status is `Broken`:
 
 ```bash
-sake dev/tasks/cleanup-broken-jobs
+sake dev/tasks/cleanup-broken-jobs     # Silverstripe 5
+sake tasks:cleanup-broken-jobs         # Silverstripe 6
 ```
 
 Only `Broken` jobs are removed; all other statuses are left untouched.
@@ -336,10 +372,10 @@ your own `grabMutex()`.
 
 ## Dev Tasks
 
-| Task | Segment | Description |
+| Task | SS5 segment / SS6 command | Description |
 |------|---------|-------------|
-| Check Default Jobs | `check-default-jobs` | Report declared default jobs and whether they're queued (`yaml=1` emits the core `defaultJobs` config). Creates nothing. |
-| Cleanup Broken Jobs | `cleanup-broken-jobs` | Delete all broken jobs |
+| Check Default Jobs | `check-default-jobs` / `tasks:check-default-jobs` | Report declared default jobs and whether they're queued (`yaml=1`, or `--yaml` on SS6, emits the core `defaultJobs` config). Creates nothing. |
+| Cleanup Broken Jobs | `cleanup-broken-jobs` / `tasks:cleanup-broken-jobs` | Delete all broken jobs |
 
 ## Module Structure
 
@@ -358,7 +394,9 @@ src/
 │   └── ImmediateJobRunner.php          # CLI spawn (flock-serialised) for immediate execution
 └── Tasks/
     ├── CheckDefaultJobsTask.php        # Report default jobs / emit defaultJobs YAML
-    └── CleanupBrokenJobsTask.php       # Delete broken jobs
+    ├── CheckDefaultJobsTaskEntryPoint.php   # run() on SS5 / execute() on SS6
+    ├── CleanupBrokenJobsTask.php       # Delete broken jobs
+    └── CleanupBrokenJobsTaskEntryPoint.php  # run() on SS5 / execute() on SS6
 
 client/js/
 └── job-progress.js                     # Vanilla JS polling component
@@ -366,10 +404,20 @@ client/js/
 
 ## Testing
 
+Run from a host project that requires the module as a symlinked path repository (`/tests` must
+be present, so not a dist install):
+
 ```bash
-vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests/
-# expected: OK (49 tests, 125 assertions)
+# Silverstripe 5 (PHPUnit 9): flush=1 only works after an explicit test path
+vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
+# Silverstripe 6 (PHPUnit 11): the flush is an environment variable
+SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
+# expected on both: OK (57 tests); 146 assertions on SS5, 147 on SS6 (one test asserts the
+# version-specific spawn command)
 ```
+
+CI (`.github/workflows/ci.yml`) runs the suite on Silverstripe 5 (PHP 8.1 and 8.3) and
+Silverstripe 6 (PHP 8.3), then boots each host, builds the database and runs both dev tasks.
 
 The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, the `queuedjob-` spawn contract, `flock` wrapping, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 

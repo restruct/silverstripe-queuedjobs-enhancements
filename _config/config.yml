@@ -13,7 +13,8 @@ Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
 # Self-declaring default jobs ($is_default_job = true) are DIAGNOSTIC ONLY — this module
 # does not create or schedule them. Core already does that: QueuedJobService::runQueue()
 # calls checkDefaultJobs() on every ProcessJobQueueTask run. Use
-# `sake dev/tasks/check-default-jobs yaml=1` to emit the core `defaultJobs` block to paste.
+# `sake dev/tasks/check-default-jobs yaml=1` (SS5) or `sake tasks:check-default-jobs --yaml`
+# (SS6) to emit the core `defaultJobs` block to paste.
 
 # Concurrency guard (OPT-IN, per project): swap the queued-jobs service for the module's
 # subclass to enforce `private static bool $prevent_concurrent_runs = true` on job classes
