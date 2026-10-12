@@ -412,7 +412,7 @@ be present, so not a dist install):
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
 # Silverstripe 6 (PHPUnit 11): the flush is an environment variable
 SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
-# expected on both: OK (57 tests); 146 assertions on SS5, 147 on SS6 (one test asserts the
+# expected on both: OK (58 tests); 148 assertions on SS5, 149 on SS6 (one test asserts the
 # version-specific spawn command)
 ```
 

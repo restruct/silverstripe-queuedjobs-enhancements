@@ -9,6 +9,7 @@ use SilverStripe\Core\Config\Configurable;
 use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\Core\Injector\Injector;
 use SilverStripe\ORM\FieldType\DBDatetime;
+use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
 use Symbiote\QueuedJobs\Services\QueuedJobService;
 
@@ -106,8 +107,12 @@ class ImmediateJobRunner
         # StartAfter (only getNextPendingJob() does), so spawning for a future start ran the job
         # straight away, ignoring the requested time. A future job is left to the queue runner,
         # which picks it up once StartAfter has passed.
+        # The start time is read back from the DESCRIPTOR, not taken from $startAfter: queueJob()
+        # returns an existing New/Initialising descriptor with the same signature instead of
+        # creating one, and that one may carry a future StartAfter of its own.
         // static::spawnJobProcess($descriptorId);  // old: spawned regardless of $startAfter
-        if (static::isDue($startAfter)) {
+        $descriptor = QueuedJobDescriptor::get()->byID($descriptorId);
+        if (static::isDue($descriptor ? $descriptor->StartAfter : $startAfter)) {
             static::spawnJobProcess($descriptorId);
         }
 

@@ -33,6 +33,8 @@ Silverstripe 6 support, in the same code line as Silverstripe 5.
 - `ImmediateJobRunner::queueAndRun($job, $startAfter)` with a future `$startAfter` spawned a
   process that ran the job at once, ignoring the start time (the single-job path in
   `ProcessJobQueueTask` never reads `StartAfter`). A future job is now left to the queue runner.
+  The check reads the descriptor's own `StartAfter`, so it also covers `queueJob()` handing back an
+  existing, deduplicated descriptor that was scheduled for later.
 - README and `DefaultJobManager` docblock showed `private static int $default_job_type =
   QueuedJob::QUEUED;`, which is a compile-time fatal (the constant is a string). Now `string`.
 

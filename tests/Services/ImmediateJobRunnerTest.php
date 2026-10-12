@@ -217,6 +217,24 @@ class ImmediateJobRunnerTest extends SapphireTest
     }
 
     /**
+     * Same defect by another route: queueJob() deduplicates on signature and hands back an
+     * existing New descriptor, which can have a future StartAfter even when this call passed
+     * none. That descriptor must not be spawned either.
+     */
+    public function testDeduplicatedFutureDescriptorDoesNotSpawn(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', false);
+        DBDatetime::set_mock_now('2026-10-12 12:00:00');
+        RecordingImmediateJobRunner::$spawned = [];
+
+        $existing = QueuedJobService::singleton()->queueJob(new StubNonDefaultJob(), '2026-10-12 13:00:00');
+        $descriptorId = RecordingImmediateJobRunner::queueAndRun(new StubNonDefaultJob());
+
+        $this->assertSame($existing, $descriptorId, 'precondition: queueJob() returned the existing descriptor');
+        $this->assertSame([], RecordingImmediateJobRunner::$spawned);
+    }
+
+    /**
      * Control for the above: no start time, or one that has passed, still spawns.
      */
     public function testDueJobsStillSpawn(): void
