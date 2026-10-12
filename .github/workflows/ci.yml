@@ -109,7 +109,8 @@ jobs:
           # Blocking is disabled HERE ONLY, in a throwaway CI host project.
           composer config policy.advisories.block false
           composer update --no-interaction --no-progress
-          composer show silverstripe/framework symbiote/silverstripe-queuedjobs phpunit/phpunit | grep -E '^(name|versions)'
+          # composer show takes one package (plus an optional version), so list the resolved versions one by one.
+          for p in silverstripe/framework symbiote/silverstripe-queuedjobs phpunit/phpunit; do composer show "$p" | grep -E '^(name|versions)'; done
 
       - name: Configure the test suite
         run: |
