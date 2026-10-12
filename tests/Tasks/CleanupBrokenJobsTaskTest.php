@@ -6,10 +6,39 @@ use Restruct\QueuedJobsEnhancements\Tasks\CleanupBrokenJobsTask;
 use SilverStripe\Dev\SapphireTest;
 use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
+use SilverStripe\PolyExecution\PolyOutput;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Input\InputDefinition;
+use Symfony\Component\Console\Output\BufferedOutput;
 
 class CleanupBrokenJobsTaskTest extends SapphireTest
 {
     protected $usesDatabase = true;
+
+    /**
+     * Run the task through the public entry point of whichever Silverstripe major is installed
+     * and return everything it printed.
+     *
+     * The tests called `$task->run(null)` under output buffering, which is the SS5 BuildTask API.
+     * On SS6 run() is `run(InputInterface, PolyOutput): int` (BuildTask is a PolyCommand), so the
+     * same call is a TypeError there. The SS6 branch drives it the way upstream's own
+     * ProcessJobQueueTaskTest does; the SS5 branch is the original call, unchanged.
+     */
+    protected function runTask(CleanupBrokenJobsTask $task): string
+    {
+        if (!class_exists(PolyOutput::class)) {
+            ob_start();
+            $task->run(null);
+            return (string) ob_get_clean();
+        }
+
+        $input = new ArrayInput([], new InputDefinition($task->getOptions()));
+        $input->setInteractive(false);
+        $buffer = new BufferedOutput();
+        $task->run($input, new PolyOutput(PolyOutput::FORMAT_ANSI, wrappedOutput: $buffer));
+
+        return $buffer->fetch();
+    }
 
     public function testDeletesBrokenJobs(): void
     {
@@ -36,9 +65,10 @@ class CleanupBrokenJobsTaskTest extends SapphireTest
         $task = CleanupBrokenJobsTask::create();
 
         # Capture output
-        ob_start();
-        $task->run(null);
-        $output = ob_get_clean();
+        // ob_start();
+        // $task->run(null);
+        // $output = ob_get_clean();
+        $output = $this->runTask($task);
 
         # Broken jobs should be deleted
         $this->assertNull(QueuedJobDescriptor::get()->byID($broken1->ID));
@@ -57,9 +87,10 @@ class CleanupBrokenJobsTaskTest extends SapphireTest
     {
         $task = CleanupBrokenJobsTask::create();
 
-        ob_start();
-        $task->run(null);
-        $output = ob_get_clean();
+        // ob_start();
+        // $task->run(null);
+        // $output = ob_get_clean();
+        $output = $this->runTask($task);
 
         $this->assertStringContainsString('No broken jobs found', $output);
     }
@@ -88,9 +119,10 @@ class CleanupBrokenJobsTaskTest extends SapphireTest
 
         $task = CleanupBrokenJobsTask::create();
 
-        ob_start();
-        $task->run(null);
-        ob_get_clean();
+        // ob_start();
+        // $task->run(null);
+        // ob_get_clean();
+        $this->runTask($task);
 
         # All non-broken jobs should still exist
         foreach ($ids as $id) {

@@ -74,6 +74,31 @@ class ScheduledMethodCallTest extends SapphireTest
         $this->assertEquals(QueuedJob::QUEUED, $job->getJobType());
     }
 
+    /**
+     * Regression: getJobType() was typed `: int`. On SS6 QueuedJobDescriptor.JobType is a
+     * validated Varchar, so every queueJob() of a ScheduledMethodCall threw
+     * `ValidationException: Must be a string - fieldName: JobType`. Asserts the type directly, so
+     * it also goes red on SS5, where the int stored without complaint.
+     */
+    public function testJobTypeIsAStringSoSs6CanStoreIt(): void
+    {
+        $job = new ScheduledMethodCall(ScheduledMethodCallTestHelper::class, 'staticMethod');
+        $this->assertSame(QueuedJob::QUEUED, $job->getJobType());
+
+        # A caller passing an int queue number in $options gets the same normalised string
+        $job = new ScheduledMethodCall(ScheduledMethodCallTestHelper::class, 'staticMethod', [], ['jobType' => 3]);
+        $this->assertSame(QueuedJob::LARGE, $job->getJobType());
+
+        # And it round-trips through the real queue on both majors
+        $descriptorId = ScheduledMethodCall::schedule(
+            ScheduledMethodCallTestHelper::class,
+            'staticMethod',
+            [],
+            ['description' => 'JobType round trip', 'jobType' => QueuedJob::LARGE],
+        );
+        $this->assertSame(QueuedJob::LARGE, (string) QueuedJobDescriptor::get()->byID($descriptorId)->JobType);
+    }
+
     public function testProcessCallsStaticMethod(): void
     {
         ScheduledMethodCallTestHelper::$lastCalled = null;

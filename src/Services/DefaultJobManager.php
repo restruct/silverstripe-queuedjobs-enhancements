@@ -33,7 +33,7 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  * Usage on a job class:
  *   private static bool $is_default_job = true;
  *   private static string $default_schedule = '+5 minutes';
- *   private static int $default_job_type = QueuedJob::QUEUED;       // optional
+ *   private static string $default_job_type = QueuedJob::QUEUED;    // optional (a string: the constants are)
  *   private static array $default_construct = [];                    // optional
  *
  * @see \Restruct\QueuedJobsEnhancements\Tasks\CheckDefaultJobsTask

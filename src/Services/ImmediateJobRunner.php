@@ -8,6 +8,8 @@ use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Config\Configurable;
 use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\Core\Injector\Injector;
+use SilverStripe\ORM\FieldType\DBDatetime;
+use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
 use Symbiote\QueuedJobs\Services\QueuedJobService;
 
@@ -50,7 +52,7 @@ class ImmediateJobRunner
     private static bool $use_spawn_lock = true;
 
     /**
-     * Lock file for the above. Relative paths resolve under TEMP_FOLDER.
+     * Lock file for the above. Relative paths resolve under TEMP_PATH.
      */
     private static string $spawn_lock_file = 'queuedjobs-enhancements-spawn.lock';
 
@@ -100,10 +102,40 @@ class ImmediateJobRunner
         # Queue normally first (safety net — cron picks it up if spawn fails)
         $descriptorId = $service->queueJob($job, $startAfter);
 
-        # Spawn background CLI process to run this specific job
-        static::spawnJobProcess($descriptorId);
+        # Spawn background CLI process to run this specific job - but only when it is due.
+        # The spawned process runs it through QueuedJobService::runJob(), which never looks at
+        # StartAfter (only getNextPendingJob() does), so spawning for a future start ran the job
+        # straight away, ignoring the requested time. A future job is left to the queue runner,
+        # which picks it up once StartAfter has passed.
+        # The start time is read back from the DESCRIPTOR, not taken from $startAfter: queueJob()
+        # returns an existing New/Initialising descriptor with the same signature instead of
+        # creating one, and that one may carry a future StartAfter of its own.
+        // static::spawnJobProcess($descriptorId);  // old: spawned regardless of $startAfter
+        $descriptor = QueuedJobDescriptor::get()->byID($descriptorId);
+        if (static::isDue($descriptor ? $descriptor->StartAfter : $startAfter)) {
+            static::spawnJobProcess($descriptorId);
+        }
 
         return $descriptorId;
+    }
+
+    /**
+     * Is a job with this StartAfter due now? Null (no start time) is due. A value strtotime()
+     * cannot parse is treated as due too, which keeps the behaviour from before this check
+     * existed rather than silently never spawning.
+     */
+    protected static function isDue(?string $startAfter): bool
+    {
+        if ($startAfter === null || $startAfter === '') {
+            return true;
+        }
+        $timestamp = strtotime($startAfter);
+        if ($timestamp === false) {
+            return true;
+        }
+
+        # DBDatetime::now() rather than time(): honours set_mock_now() in tests, like core does
+        return $timestamp <= DBDatetime::now()->getTimestamp();
     }
 
     /**
@@ -139,10 +171,25 @@ class ImmediateJobRunner
      */
     protected static function buildSpawnCommand(int $descriptorId): ?string
     {
-        # Use cli-script.php directly — more reliable than sake (see SSKB cli-commands profile)
-        $cliScript = BASE_PATH . '/vendor/silverstripe/framework/cli-script.php';
-        if (!file_exists($cliScript)) {
-            static::log("Cannot spawn job #{$descriptorId}: cli-script.php not found at {$cliScript}");
+        # Silverstripe 5: use cli-script.php directly - more reliable than the sake shell wrapper
+        # (see SSKB cli-commands profile). Silverstripe 6 removed cli-script.php; its sake is a
+        # PHP script (framework bin/sake, Symfony Console), so it is run with the same PHP binary.
+        # Detected by file rather than by version so the check is the thing we actually need.
+        $frameworkDir = BASE_PATH . '/vendor/silverstripe/framework';
+        $cliScript = $frameworkDir . '/cli-script.php';
+        $sakeScript = $frameworkDir . '/bin/sake';
+        if (file_exists($cliScript)) {
+            $script = $cliScript;
+            # SS5 single-job mode only triggers when the value contains a dash (see below)
+            $taskArgs = sprintf('dev/tasks/ProcessJobQueueTask job=queuedjob-%d', $descriptorId);
+        } elseif (file_exists($sakeScript)) {
+            $script = $sakeScript;
+            # SS6 accepts "queuedjob-<ID>" on every 6.x (a bare ID only from queuedjobs 6.2.1)
+            $taskArgs = sprintf('tasks:ProcessJobQueueTask --job=queuedjob-%d', $descriptorId);
+        } else {
+            # Was: only cli-script.php was looked for, so every SS6 spawn returned null here
+            // static::log("Cannot spawn job #{$descriptorId}: cli-script.php not found at {$cliScript}");
+            static::log("Cannot spawn job #{$descriptorId}: neither cli-script.php nor bin/sake found in {$frameworkDir}");
             return null;
         }
 
@@ -160,12 +207,18 @@ class ImmediateJobRunner
         # trigger-file names inotifywait passes as `%f`. A bare `job=42` fails that check and falls
         # through to runQueue('Queued'), draining the ENTIRE queued queue instead of this one job
         # (and missing the job entirely if it is a LARGE or IMMEDIATE job).
+        // $inner = sprintf(
+        //     // '%s %s dev/tasks/ProcessJobQueueTask job=%d',  // old: bare ID, no dash
+        //     '%s %s dev/tasks/ProcessJobQueueTask job=queuedjob-%d',
+        //     escapeshellarg($phpBinary),
+        //     escapeshellarg($cliScript),
+        //     $descriptorId
+        // );
         $inner = sprintf(
-            // '%s %s dev/tasks/ProcessJobQueueTask job=%d',  // old: bare ID, no dash
-            '%s %s dev/tasks/ProcessJobQueueTask job=queuedjob-%d',
+            '%s %s %s',
             escapeshellarg($phpBinary),
-            escapeshellarg($cliScript),
-            $descriptorId
+            escapeshellarg($script),
+            $taskArgs
         );
 
         # Optionally serialise spawns behind a lock so a burst of dispatches cannot fork an
@@ -223,7 +276,11 @@ class ImmediateJobRunner
 
         $lockFile = (string) $config->get('spawn_lock_file');
         if ($lockFile === '' || $lockFile[0] !== '/') {
-            $lockFile = TEMP_FOLDER . '/' . ($lockFile ?: 'queuedjobs-enhancements-spawn.lock');
+            # TEMP_PATH, not TEMP_FOLDER: Silverstripe 6 no longer defines TEMP_FOLDER, so this line
+            # fataled ("Undefined constant") on SS6 whenever flock was installed. On SS5 the two
+            # are the same value (framework 5 constants.php defines TEMP_FOLDER from TEMP_PATH).
+            // $lockFile = TEMP_FOLDER . '/' . ($lockFile ?: 'queuedjobs-enhancements-spawn.lock');
+            $lockFile = TEMP_PATH . '/' . ($lockFile ?: 'queuedjobs-enhancements-spawn.lock');
         }
 
         $timeout = (int) $config->get('spawn_lock_timeout');

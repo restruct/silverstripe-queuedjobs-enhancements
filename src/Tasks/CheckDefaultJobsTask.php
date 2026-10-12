@@ -14,23 +14,74 @@ use SilverStripe\Dev\BuildTask;
  * re-checks on every `ProcessJobQueueTask` run.
  *
  * Usage:
- *   sake dev/tasks/check-default-jobs           # report declared jobs + queue status
- *   sake dev/tasks/check-default-jobs yaml=1    # print the defaultJobs YAML to paste
+ *   Silverstripe 5:
+ *     sake dev/tasks/check-default-jobs           # report declared jobs + queue status
+ *     sake dev/tasks/check-default-jobs yaml=1    # print the defaultJobs YAML to paste
+ *   Silverstripe 6:
+ *     sake tasks:check-default-jobs
+ *     sake tasks:check-default-jobs --yaml
+ *
+ * The entry point (run() on SS5, execute() + getOptions() on SS6) and getDescription() come from
+ * CheckDefaultJobsTaskEntryPoint, because BuildTask's shape differs between the two majors in
+ * ways one class body cannot satisfy - see that file for why it is done this way.
  *
  * @config string $segment
  */
 class CheckDefaultJobsTask extends BuildTask
 {
+    use CheckDefaultJobsTaskEntryPoint;
+
+    /**
+     * Silverstripe 5 URL segment (dev/tasks/check-default-jobs). Inert config on Silverstripe 6,
+     * where $commandName names the task instead.
+     */
     private static string $segment = 'check-default-jobs';
 
-    protected $title = 'Check Default Jobs';
+    /**
+     * Silverstripe 6 command name (sake tasks:check-default-jobs). A compatible redeclaration of
+     * PolyCommand::$commandName on SS6, a new unused static on SS5.
+     */
+    protected static string $commandName = 'check-default-jobs';
 
-    protected $description = 'Reports job classes declaring $is_default_job = true and whether they are queued. '
-        . 'Creates nothing. Use yaml=1 to emit a defaultJobs config block.';
+    // Were declared as properties; a fatal "must be compatible" error on SS6, where BuildTask
+    // types $title and makes $description a typed static (see CleanupBrokenJobsTask).
+//    protected $title = 'Check Default Jobs';
+//
+//    protected $description = 'Reports job classes declaring $is_default_job = true and whether they are queued. '
+//        . 'Creates nothing. Use yaml=1 to emit a defaultJobs config block.';
 
-    public function run($request): void
+    /**
+     * Shared by both majors' getDescription() (see the entry-point trait).
+     */
+    public const DESCRIPTION = 'Reports job classes declaring $is_default_job = true and whether they are queued. '
+        . 'Creates nothing. Use yaml=1 (SS5) or --yaml (SS6) to emit a defaultJobs config block.';
+
+    /**
+     * Where outputReport()/outputYaml() write to. Set per run by the entry point: echo on SS5,
+     * PolyOutput on SS6.
+     *
+     * @var callable|null
+     */
+    protected $writer = null;
+
+    public function __construct()
     {
-        if ($request && $request->getVar('yaml')) {
+        parent::__construct();
+        # Assigned rather than declared: untyped on SS5, `string` on SS6 (see above)
+        $this->title = 'Check Default Jobs';
+    }
+
+    /**
+     * Version-neutral body of the task.
+     *
+     * @param callable $write function (string $message): void
+     * @param bool $yaml true to print the defaultJobs YAML block instead of the report
+     */
+    public function check(callable $write, bool $yaml = false): void
+    {
+        $this->writer = $write;
+
+        if ($yaml) {
             $this->outputYaml();
             return;
         }
@@ -77,7 +128,7 @@ class CheckDefaultJobsTask extends BuildTask
         # This task deliberately creates nothing — point at the mechanism that does
         $this->output('This task does not create jobs. To have them created and kept alive,');
         $this->output('add them to the core `defaultJobs` config. Run with yaml=1 to print it:');
-        $this->output('  sake dev/tasks/check-default-jobs yaml=1');
+        $this->output('  sake dev/tasks/check-default-jobs yaml=1   (Silverstripe 6: sake tasks:check-default-jobs --yaml)');
     }
 
     /**
@@ -100,6 +151,11 @@ class CheckDefaultJobsTask extends BuildTask
 
     protected function output(string $message): void
     {
+        # The entry point sets the writer; echo stays the fallback for a direct call
+        if ($this->writer) {
+            ($this->writer)($message);
+            return;
+        }
         echo $message . PHP_EOL;
     }
 }

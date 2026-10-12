@@ -3,9 +3,12 @@
 namespace Restruct\QueuedJobsEnhancements\Tests\Services;
 
 use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
+use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubDefaultJob;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubNonDefaultJob;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Dev\SapphireTest;
+use SilverStripe\ORM\FieldType\DBDatetime;
+use SilverStripe\PolyExecution\PolyOutput;
 use SilverStripe\Security\Member;
 use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
@@ -193,6 +196,98 @@ class ImmediateJobRunnerTest extends SapphireTest
     }
 
     /**
+     * Regression: queueAndRun($job, $futureStartAfter) spawned a process that ran the job at
+     * once. The spawn runs `ProcessJobQueueTask job=queuedjob-<ID>`, which goes straight to
+     * QueuedJobService::runJob(), and runJob() never reads StartAfter (only getNextPendingJob()
+     * does). A job with a future start must be left to the queue runner instead.
+     */
+    public function testFutureStartAfterDoesNotSpawn(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', false);
+        DBDatetime::set_mock_now('2026-10-12 12:00:00');
+        RecordingImmediateJobRunner::$spawned = [];
+
+        $descriptorId = RecordingImmediateJobRunner::queueAndRun(new StubNonDefaultJob(), '2026-10-12 13:00:00');
+
+        # Still queued, with the requested start time, so the runner picks it up when due
+        $descriptor = QueuedJobDescriptor::get()->byID($descriptorId);
+        $this->assertNotNull($descriptor);
+        $this->assertSame('2026-10-12 13:00:00', $descriptor->StartAfter);
+        $this->assertSame([], RecordingImmediateJobRunner::$spawned, 'a job that is not due yet must not be spawned');
+    }
+
+    /**
+     * Same defect by another route: queueJob() deduplicates on signature and hands back an
+     * existing New descriptor, which can have a future StartAfter even when this call passed
+     * none. That descriptor must not be spawned either.
+     */
+    public function testDeduplicatedFutureDescriptorDoesNotSpawn(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', false);
+        DBDatetime::set_mock_now('2026-10-12 12:00:00');
+        RecordingImmediateJobRunner::$spawned = [];
+
+        $existing = QueuedJobService::singleton()->queueJob(new StubNonDefaultJob(), '2026-10-12 13:00:00');
+        $descriptorId = RecordingImmediateJobRunner::queueAndRun(new StubNonDefaultJob());
+
+        $this->assertSame($existing, $descriptorId, 'precondition: queueJob() returned the existing descriptor');
+        $this->assertSame([], RecordingImmediateJobRunner::$spawned);
+    }
+
+    /**
+     * Control for the above: no start time, or one that has passed, still spawns.
+     */
+    public function testDueJobsStillSpawn(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', false);
+        DBDatetime::set_mock_now('2026-10-12 12:00:00');
+        RecordingImmediateJobRunner::$spawned = [];
+
+        $now = RecordingImmediateJobRunner::queueAndRun(new StubNonDefaultJob());
+        $past = RecordingImmediateJobRunner::queueAndRun(new StubDefaultJob(), '2026-10-12 11:59:00');
+
+        $this->assertSame([$now, $past], RecordingImmediateJobRunner::$spawned);
+    }
+
+    /**
+     * SS6 removed cli-script.php, so buildSpawnCommand() returned null there and every spawn was
+     * silently skipped (the job waited for cron). Each major must get a runnable command.
+     */
+    public function testSpawnCommandMatchesTheInstalledMajor(): void
+    {
+        Config::modify()->set(ImmediateJobRunner::class, 'use_spawn_lock', false);
+
+        $cmd = $this->buildSpawnCommand(77);
+        $this->assertNotNull($cmd);
+
+        if (class_exists(PolyOutput::class)) {
+            # SS6: framework's PHP sake script, Symfony-style option
+            $this->assertStringContainsString('silverstripe/framework/bin/sake', $cmd);
+            $this->assertStringContainsString('tasks:ProcessJobQueueTask --job=queuedjob-77', $cmd);
+            $this->assertStringNotContainsString('cli-script.php', $cmd);
+        } else {
+            $this->assertStringContainsString('silverstripe/framework/cli-script.php', $cmd);
+            $this->assertStringContainsString('dev/tasks/ProcessJobQueueTask job=queuedjob-77', $cmd);
+        }
+    }
+
+    /**
+     * A relative spawn_lock_file resolves under TEMP_PATH. It used TEMP_FOLDER, which SS6 no
+     * longer defines, so building a locked command fataled there whenever flock was installed.
+     */
+    public function testRelativeLockFileResolvesUnderTempPath(): void
+    {
+        Config::modify()->set(StubFlockImmediateJobRunner::class, 'use_spawn_lock', true);
+        Config::modify()->set(StubFlockImmediateJobRunner::class, 'spawn_lock_file', 'qje-test.lock');
+
+        $method = new \ReflectionMethod(StubFlockImmediateJobRunner::class, 'wrapWithLock');
+        $method->setAccessible(true);
+        $cmd = $method->invoke(null, 'true');
+
+        $this->assertStringContainsString(escapeshellarg(TEMP_PATH . '/qje-test.lock'), $cmd);
+    }
+
+    /**
      * Guards the documented prerequisite for the inotify path: the trigger file that
      * inotifywait watches is only written when JobType === IMMEDIATE *and*
      * QueuedJobService.use_shutdown_function is false (QueuedJobDescriptor::activateOnQueue()).
@@ -209,7 +304,9 @@ class ImmediateJobRunnerTest extends SapphireTest
 
         $jobDir = Config::inst()->get(QueuedJobService::class, 'cache_dir');
         if ($jobDir[0] !== '/') {
-            $jobDir = TEMP_FOLDER . '/' . $jobDir;
+            # TEMP_PATH: Silverstripe 6 no longer defines TEMP_FOLDER (same value on SS5)
+            // $jobDir = TEMP_FOLDER . '/' . $jobDir;
+            $jobDir = TEMP_PATH . '/' . $jobDir;
         }
 
         $this->assertFileExists(
@@ -238,5 +335,21 @@ class StubNoFlockImmediateJobRunner extends ImmediateJobRunner
     protected static function resolveFlockBinary(): ?string
     {
         return null;
+    }
+}
+
+/**
+ * Records spawn requests instead of shelling out, so the "should it spawn" decision in
+ * queueAndRun() is observable. (spawnJobProcess() early-returns under CLI anyway, which is why
+ * the real one cannot be asserted on.)
+ */
+class RecordingImmediateJobRunner extends ImmediateJobRunner
+{
+    /** @var int[] descriptor IDs queueAndRun() asked to spawn */
+    public static array $spawned = [];
+
+    protected static function spawnJobProcess(int $descriptorId): void
+    {
+        static::$spawned[] = $descriptorId;
     }
 }

@@ -31,7 +31,7 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  * @property string $method Method name to call (jobData)
  * @property array $arguments Arguments passed to the method (jobData)
  * @property string $description Human-readable job description (jobData)
- * @property int $jobType QueuedJob type constant (jobData)
+ * @property string|int $jobType QueuedJob type constant (jobData); returned as a string by getJobType()
  * @property string $appendSig Random signature suffix for ignoreIdentical (jobData)
  */
 class ScheduledMethodCall extends AbstractQueuedJob
@@ -142,12 +142,24 @@ class ScheduledMethodCall extends AbstractQueuedJob
         return $this->description ?: 'ScheduledMethodCall';
     }
 
-    public function getJobType(): int
+    // Was typed `: int` with an int cast. Equivalent on SS5, where the int stored fine, but on
+    // SS6 QueuedJobDescriptor.JobType is a validated Varchar: every queueJob() of this job threw
+    // `ValidationException: Must be a string - fieldName: JobType` (measured on framework 6.2.11 /
+    // queuedjobs 6.2.2; regression test ScheduledMethodCallTest::testJobTypeIsAStringSoSs6CanStoreIt).
+//    public function getJobType(): int
+//    {
+//        # Intentional divergence from admintweaks (`return $this->jobType;`): int cast + QUEUED
+//        # fallback for the typed signature. Equivalent — QueuedJob constants are numeric strings
+//        # ('1'/'2'/'3') and every consumer compares loosely (e.g. JobType == QueuedJob::IMMEDIATE).
+//        return (int) ($this->jobType ?: QueuedJob::QUEUED);
+//    }
+
+    public function getJobType(): string
     {
-        # Intentional divergence from admintweaks (`return $this->jobType;`): int cast + QUEUED
-        # fallback for the typed signature. Equivalent — QueuedJob constants are numeric strings
-        # ('1'/'2'/'3') and every consumer compares loosely (e.g. JobType == QueuedJob::IMMEDIATE).
-        return (int) ($this->jobType ?: QueuedJob::QUEUED);
+        # Intentional divergence from admintweaks (`return $this->jobType;`): string cast + QUEUED
+        # fallback for the typed signature. The QueuedJob constants are numeric STRINGS ('1'/'2'/'3'),
+        # and the cast also normalises a caller passing an int ('jobType' => 3) in $options.
+        return (string) ($this->jobType ?: QueuedJob::QUEUED);
     }
 
     public function getSignature(): string
