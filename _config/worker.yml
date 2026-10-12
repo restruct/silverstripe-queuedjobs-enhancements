@@ -1,0 +1,17 @@
+---
+Name: queuedjobs-enhancements-worker-ss6
+Only:
+  classexists: 'SilverStripe\PolyExecution\PolyCommand'
+---
+# Silverstripe 6: the worker is a sake command of its own (sake queuedjobs:work / queuedjobs:restart).
+SilverStripe\Cli\Sake:
+  commands:
+    - 'Restruct\QueuedJobsEnhancements\Cli\QueueWorkCommand'
+    - 'Restruct\QueuedJobsEnhancements\Cli\QueueRestartCommand'
+
+# The Silverstripe 5 BuildTask entry points would otherwise show up as tasks:QueuedJobsWorkTask
+# etc. next to the commands above; one name per major is enough.
+Restruct\QueuedJobsEnhancements\Tasks\QueuedJobsWorkTask:
+  is_enabled: false
+Restruct\QueuedJobsEnhancements\Tasks\QueuedJobsRestartTask:
+  is_enabled: false
