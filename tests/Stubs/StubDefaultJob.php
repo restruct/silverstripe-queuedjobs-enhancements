@@ -18,7 +18,16 @@ class StubDefaultJob extends AbstractQueuedJob implements QueuedJob
         return 'Stub default job';
     }
 
-    public function getJobType(): int
+    // Was `: int`. The QueuedJob constants are strings ('1'/'2'/'3') and PHP coerced QUEUED to
+    // int 2 here; on SS6 QueuedJobDescriptor.JobType is a validated Varchar, so queueing this stub
+    // threw `ValidationException: Must be a string - fieldName: JobType` before any assertion ran.
+    // The same defect as ScheduledMethodCall::getJobType(), reproduced in the fixture.
+//    public function getJobType(): int
+//    {
+//        return QueuedJob::QUEUED;
+//    }
+
+    public function getJobType(): string
     {
         return QueuedJob::QUEUED;
     }
