@@ -5,8 +5,8 @@
     "license": "MIT",
     "require": {
         "php": "^8.1",
-        "silverstripe/framework": "^5",
-        "symbiote/silverstripe-queuedjobs": "^5"
+        "silverstripe/framework": "^5.4 || ^6",
+        "symbiote/silverstripe-queuedjobs": "^5 || ^6"
     },
     "autoload": {
         "psr-4": {
