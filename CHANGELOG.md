@@ -3,7 +3,7 @@
 All notable changes to this module. Versions before this file existed are described by their
 git tags (1.0.0 to 1.4.0).
 
-## Unreleased (branch `ss6`)
+## 1.5.0 (2026-10-12)
 
 Silverstripe 6 support, in the same code line as Silverstripe 5.
 
