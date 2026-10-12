@@ -98,16 +98,25 @@ class ImmediateJobRunnerTest extends SapphireTest
         return $method->invoke(null, $descriptorId);
     }
 
-    public function testSpawnCommandUsesQueuedjobDashPrefix(): void
+    /**
+     * Up to 1.5.0 this was testSpawnCommandUsesQueuedjobDashPrefix: the spawn ran
+     * ProcessJobQueueTask, which needs "queuedjob-<ID>". Since 1.6.0 the spawn runs the module's
+     * worker for one job (issue #5, design agreed in comment 6123041583: ProcessJobQueueTask's
+     * process drained the whole immediate queue at exit). The worker takes a bare ID.
+     */
+    public function testSpawnCommandRunsTheWorkerForOneJob(): void
     {
         Config::modify()->set(ImmediateJobRunner::class, 'use_spawn_lock', false);
 
         $cmd = $this->buildSpawnCommand(123);
         $this->assertNotNull($cmd, 'cli-script.php should exist on SS5');
 
-        # Without the dash, ProcessJobQueueTask falls through to draining the whole queue
-        $this->assertStringContainsString('job=queuedjob-123', $cmd);
-        $this->assertStringNotContainsString('job=123', $cmd);
+        // # Without the dash, ProcessJobQueueTask falls through to draining the whole queue
+        // $this->assertStringContainsString('job=queuedjob-123', $cmd);
+        // $this->assertStringNotContainsString('job=123', $cmd);
+        $this->assertStringContainsString('job=123', $cmd);
+        $this->assertStringContainsString('max-jobs=1', $cmd);
+        $this->assertStringNotContainsString('ProcessJobQueueTask', $cmd);
 
         # Detached, output discarded (exec() blocks otherwise)
         $this->assertStringContainsString('nohup', $cmd);
@@ -147,10 +156,12 @@ class ImmediateJobRunnerTest extends SapphireTest
 
         $this->assertStringContainsString('flock', $cmd);
         $this->assertStringContainsString('-w 42', $cmd);
-        $this->assertStringContainsString('job=queuedjob-123', $cmd);
+        // $this->assertStringContainsString('job=queuedjob-123', $cmd);  // 1.5.0 spawn command, see testSpawnCommandRunsTheWorkerForOneJob
+        $this->assertStringContainsString('job=123', $cmd);
         # flock must wrap the php command, not follow it
         $this->assertLessThan(
-            strpos($cmd, 'ProcessJobQueueTask'),
+            // strpos($cmd, 'ProcessJobQueueTask'),  // 1.5.0 spawn command
+            strpos($cmd, 'job=123'),
             strpos($cmd, 'flock'),
             'flock must precede the command it guards'
         );
@@ -182,7 +193,8 @@ class ImmediateJobRunnerTest extends SapphireTest
         $cmd = $method->invoke(null, 9);
 
         $this->assertStringNotContainsString('flock', $cmd);
-        $this->assertStringContainsString('job=queuedjob-9', $cmd);
+        // $this->assertStringContainsString('job=queuedjob-9', $cmd);  // 1.5.0 spawn command
+        $this->assertStringContainsString('job=9', $cmd);
     }
 
     public function testSpawnCommandOmitsLockWhenDisabled(): void
@@ -192,7 +204,8 @@ class ImmediateJobRunnerTest extends SapphireTest
         $cmd = $this->buildSpawnCommand(7);
 
         $this->assertStringNotContainsString('flock', $cmd);
-        $this->assertStringContainsString('job=queuedjob-7', $cmd);
+        // $this->assertStringContainsString('job=queuedjob-7', $cmd);  // 1.5.0 spawn command
+        $this->assertStringContainsString('job=7', $cmd);
     }
 
     /**
@@ -263,11 +276,13 @@ class ImmediateJobRunnerTest extends SapphireTest
         if (class_exists(PolyOutput::class)) {
             # SS6: framework's PHP sake script, Symfony-style option
             $this->assertStringContainsString('silverstripe/framework/bin/sake', $cmd);
-            $this->assertStringContainsString('tasks:ProcessJobQueueTask --job=queuedjob-77', $cmd);
+            // $this->assertStringContainsString('tasks:ProcessJobQueueTask --job=queuedjob-77', $cmd);  // 1.5.0
+            $this->assertStringContainsString('queuedjobs:work --job=77 --max-jobs=1', $cmd);
             $this->assertStringNotContainsString('cli-script.php', $cmd);
         } else {
             $this->assertStringContainsString('silverstripe/framework/cli-script.php', $cmd);
-            $this->assertStringContainsString('dev/tasks/ProcessJobQueueTask job=queuedjob-77', $cmd);
+            // $this->assertStringContainsString('dev/tasks/ProcessJobQueueTask job=queuedjob-77', $cmd);  // 1.5.0
+            $this->assertStringContainsString('dev/tasks/QueuedJobsWorkTask job=77 max-jobs=1', $cmd);
         }
     }
 
