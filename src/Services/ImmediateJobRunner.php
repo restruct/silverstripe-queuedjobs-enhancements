@@ -178,14 +178,22 @@ class ImmediateJobRunner
         $frameworkDir = BASE_PATH . '/vendor/silverstripe/framework';
         $cliScript = $frameworkDir . '/cli-script.php';
         $sakeScript = $frameworkDir . '/bin/sake';
+        # The spawn runs this module's worker for this ONE job, not ProcessJobQueueTask. Any CLI
+        # process that instantiates QueuedJobService drains the whole IMMEDIATE queue at exit
+        # (its constructor registers onShutdown(); SSKB queuedjobs §12), so `ProcessJobQueueTask
+        # job=queuedjob-<ID>` ran our job and then every other pending immediate job too ("bug 3",
+        # issue #5). The worker switches that drain off for its own process, and in --job mode it
+        # also checks the job's status and StartAfter before running it.
         if (file_exists($cliScript)) {
             $script = $cliScript;
-            # SS5 single-job mode only triggers when the value contains a dash (see below)
-            $taskArgs = sprintf('dev/tasks/ProcessJobQueueTask job=queuedjob-%d', $descriptorId);
+            // # SS5 single-job mode only triggers when the value contains a dash (see below)
+            // $taskArgs = sprintf('dev/tasks/ProcessJobQueueTask job=queuedjob-%d', $descriptorId);
+            $taskArgs = sprintf('dev/tasks/QueuedJobsWorkTask job=%d max-jobs=1', $descriptorId);
         } elseif (file_exists($sakeScript)) {
             $script = $sakeScript;
-            # SS6 accepts "queuedjob-<ID>" on every 6.x (a bare ID only from queuedjobs 6.2.1)
-            $taskArgs = sprintf('tasks:ProcessJobQueueTask --job=queuedjob-%d', $descriptorId);
+            // # SS6 accepts "queuedjob-<ID>" on every 6.x (a bare ID only from queuedjobs 6.2.1)
+            // $taskArgs = sprintf('tasks:ProcessJobQueueTask --job=queuedjob-%d', $descriptorId);
+            $taskArgs = sprintf('queuedjobs:work --job=%d --max-jobs=1', $descriptorId);
         } else {
             # Was: only cli-script.php was looked for, so every SS6 spawn returned null here
             // static::log("Cannot spawn job #{$descriptorId}: cli-script.php not found at {$cliScript}");
@@ -201,6 +209,7 @@ class ImmediateJobRunner
         //        $phpBinary = PHP_BINARY ?: 'php';
         $phpBinary = static::resolveCliPhpBinary();
 
+        # (Applied to the ProcessJobQueueTask spawn up to 1.5.0; the worker takes a bare ID.)
         # The "queuedjob-" prefix is REQUIRED. ProcessJobQueueTask only enters single-job mode
         # when the job param contains a dash — `if (($job = $request->getVar('job')) && strpos($job, '-'))`
         # — taking the part after the dash as the descriptor ID. This matches the `queuedjob-{ID}`
