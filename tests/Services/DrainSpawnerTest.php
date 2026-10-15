@@ -144,6 +144,54 @@ class DrainSpawnerTest extends SapphireTest
         $this->assertCount(0, $guarded->commands);
     }
 
+    /**
+     * Inside a transaction the runner cannot see the row before the commit (measured: a 5 s
+     * transaction lost the job until the next dispatch). Drain now AND once at the end of the
+     * process, however many jobs the transaction queues.
+     */
+    public function testInsideATransactionItAlsoDrainsAtShutdownOnce(): void
+    {
+        RecordingDrainSpawner::resetWarnings();
+        $this->spawner->transaction = true;
+
+        $this->queue(new StubImmediateJob('t1'));
+        $this->queue(new StubImmediateJob('t2'));
+
+        $this->assertCount(2, $this->spawner->commands, 'a drain per job now');
+        $this->assertCount(1, $this->spawner->shutdown, 'one end-of-process drain for the lot');
+
+        @unlink($this->spawner->markerPath());
+        ($this->spawner->shutdown[0])();
+        $this->assertCount(3, $this->spawner->commands, 'the shutdown drain spawns');
+        $this->assertFileExists($this->spawner->markerPath(), 'and touches the marker first');
+        RecordingDrainSpawner::resetWarnings();
+    }
+
+    public function testOutsideATransactionNothingIsDeferred(): void
+    {
+        RecordingDrainSpawner::resetWarnings();
+        $this->spawner->transaction = false;
+
+        $this->queue(new StubImmediateJob('plain'));
+
+        $this->assertCount(1, $this->spawner->commands);
+        $this->assertCount(0, $this->spawner->shutdown);
+    }
+
+    /**
+     * The real transaction check: SapphireTest runs each test inside a transaction.
+     */
+    public function testDetectsTheOpenTestTransaction(): void
+    {
+        RecordingDrainSpawner::resetWarnings();
+        $this->spawner->transaction = null;
+
+        $this->queue(new StubImmediateJob('real'));
+
+        $this->assertCount(1, $this->spawner->shutdown);
+        RecordingDrainSpawner::resetWarnings();
+    }
+
     public function testCommandStartsTheWrapperDetachedFromTheProjectRoot(): void
     {
         $command = $this->spawner->buildCommand();
@@ -239,9 +287,26 @@ class RecordingDrainSpawner extends DrainSpawner
 
     public bool $execAvailable = true;
 
+    /** @var bool|null null = ask the real connection (where SapphireTest always has one open) */
+    public ?bool $transaction = false;
+
+    /** @var callable[] what requestDrain() asked to run at shutdown */
+    public array $shutdown = [];
+
     public static function resetWarnings(): void
     {
         static::$warnedNoExec = false;
+        static::$shutdownDrainRegistered = false;
+    }
+
+    protected function inTransaction(): bool
+    {
+        return $this->transaction ?? parent::inTransaction();
+    }
+
+    protected function registerShutdown(callable $callback): void
+    {
+        $this->shutdown[] = $callback;
     }
 
     protected function canExec(): bool

@@ -8,6 +8,7 @@ use SilverStripe\Core\Environment;
 use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\Core\Injector\Injector;
 use SilverStripe\ORM\Connect\TempDatabase;
+use SilverStripe\ORM\DB;
 use Throwable;
 
 /**
@@ -27,6 +28,13 @@ use Throwable;
  *
  * Nothing stays resident: no Supervisor program, no inotify, no polling. The cron keeps running
  * ProcessJobQueueTask as the safety net (health checks, default jobs, jobs whose spawn failed).
+ *
+ * Inside an open database transaction the new row is not visible to the runner until the commit. A
+ * runner that finishes its linger before the commit would miss the job, and the marker is already
+ * gone, so it would wait for the next dispatch or the cron (measured: a 5 s transaction lost the job
+ * on SS5 and SS6). So a dispatch inside a transaction drains now (which covers a commit within the
+ * linger) AND once more at the end of the process (register_shutdown_function, after the commit of
+ * any normal request or task).
  *
  * Best effort. When exec() is disabled, or the command cannot be built, nothing is started and the
  * job simply waits in the IMMEDIATE queue for whatever else runs it (cron, a worker, upstream's own
@@ -79,6 +87,9 @@ class DrainSpawner
     /** @var bool so the "exec() is disabled" warning is logged once per process */
     protected static bool $warnedNoExec = false;
 
+    /** @var bool the end-of-process drain for dispatches inside a transaction is registered */
+    protected static bool $shutdownDrainRegistered = false;
+
     /**
      * Start a drain now. Returns whether a drain was started.
      */
@@ -107,6 +118,36 @@ class DrainSpawner
             return false;
         }
 
+        # Inside a transaction the row is invisible to the runner until the commit: drain again at
+        # the end of this process, once, however many jobs it queues (see the class docblock).
+        if ($this->inTransaction() && !static::$shutdownDrainRegistered) {
+            static::$shutdownDrainRegistered = true;
+            $this->registerShutdown([$this, 'runDeferredDrain']);
+        }
+
+        return $this->spawn();
+    }
+
+    /**
+     * The end-of-process drain registered for a dispatch inside a transaction. Public for
+     * register_shutdown_function() (and tests). By the time it runs, the transaction of a normal
+     * request or task was committed (or rolled back, and then the drain finds nothing).
+     */
+    public function runDeferredDrain(): void
+    {
+        try {
+            $this->spawn();
+        } catch (Throwable $e) {
+            # A shutdown function must never turn a finished request into an error page
+            $this->log('Deferred drain failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Touch the marker and start the wrapper. Returns whether it was started.
+     */
+    protected function spawn(): bool
+    {
         $command = $this->buildCommand();
         if ($command === null) {
             return false;
@@ -277,6 +318,29 @@ class DrainSpawner
             # No connection yet, or the class changed shape: not a test database as far as we know
             return false;
         }
+    }
+
+    /**
+     * Whether a transaction is open on the connection the descriptor was written to. Silverstripe 6
+     * with replicas: the primary, where writes go (SSKB orm transactions note); SS5 has one.
+     */
+    protected function inTransaction(): bool
+    {
+        try {
+            $conn = defined(DB::class . '::CONN_PRIMARY') ? DB::get_conn(DB::CONN_PRIMARY) : DB::get_conn();
+
+            return $conn && $conn->transactionDepth() > 0;
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Separate so tests can capture the callback instead of registering it.
+     */
+    protected function registerShutdown(callable $callback): void
+    {
+        register_shutdown_function($callback);
     }
 
     /**
