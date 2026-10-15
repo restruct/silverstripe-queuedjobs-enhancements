@@ -10,6 +10,20 @@ After:
 Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
   use_immediate_queue: false
 
+# Drain spawn: every new IMMEDIATE job descriptor starts bin/qje-drain.sh in the background, which
+# runs the immediate queue until it is empty (one runner at a time, behind a lock). See the README,
+# "Immediate execution". Tunables (shown with their defaults):
+#
+# Restruct\QueuedJobsEnhancements\Services\DrainSpawner:
+#   enabled: true    # false on a site that runs the immediate queue another way
+#   php_cli: ''      # CLI php binary; the QJE_PHP_CLI env var wins over this
+#   log_file: ''     # append wrapper/runner output here (relative = under TEMP_PATH)
+# Restruct\QueuedJobsEnhancements\Worker\QueueWorker:
+#   linger: 2        # seconds a drain runner keeps looking for new jobs before it exits
+Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor:
+  extensions:
+    - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobDescriptorDrainExtension
+
 # Self-declaring default jobs ($is_default_job = true) are DIAGNOSTIC ONLY — this module
 # does not create or schedule them. Core already does that: QueuedJobService::runQueue()
 # calls checkDefaultJobs() on every ProcessJobQueueTask run. Use

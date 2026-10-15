@@ -249,8 +249,22 @@ class ImmediateJobRunner
      */
     protected static function resolveCliPhpBinary(): string
     {
-        if (in_array(PHP_SAPI, ['cli', 'cli-server'], true) && PHP_BINARY) {
-            return PHP_BINARY;
+        // if (in_array(PHP_SAPI, ['cli', 'cli-server'], true) && PHP_BINARY) {
+        //     return PHP_BINARY;
+        // }
+        # old: the SAPI checks lived here; moved to resolveCliPhpBinaryFor() so a test can hand in
+        # the fpm-fcgi SAPI and php-fpm binary that a web request has
+        return static::resolveCliPhpBinaryFor(PHP_SAPI, (string) PHP_BINARY);
+    }
+
+    /**
+     * resolveCliPhpBinary() for a given SAPI and PHP_BINARY. Our own binary is only used when we are
+     * cli(-server) AND it is set; never under fpm-fcgi, where it is the FPM daemon.
+     */
+    protected static function resolveCliPhpBinaryFor(string $sapi, string $binary): string
+    {
+        if (in_array($sapi, ['cli', 'cli-server'], true) && $binary !== '') {
+            return $binary;
         }
         $versioned = sprintf('php%d.%d', PHP_MAJOR_VERSION, PHP_MINOR_VERSION);
         foreach ([PHP_BINDIR . '/' . $versioned, '/usr/bin/' . $versioned, PHP_BINDIR . '/php', '/usr/bin/php'] as $candidate) {
@@ -261,6 +275,29 @@ class ImmediateJobRunner
         static::log('No CLI php binary found next to PHP_BINDIR; spawning with bare "php" from PATH.');
 
         return 'php';
+    }
+
+    /**
+     * The CLI php binary the background runner is started with (see resolveCliPhpBinary()).
+     * Public entry point for DrainSpawner, which adds QJE_PHP_CLI and the php_cli config in front.
+     */
+    public static function cliPhpBinary(): string
+    {
+        return static::resolveCliPhpBinary();
+    }
+
+    /**
+     * Upstream's job folder: the `cache_dir` of QueuedJobService, relative paths under TEMP_PATH,
+     * created when missing. The `queuedjob-<ID>` trigger files go here, and so do the drain marker
+     * and lock (DrainSpawner). Read through upstream's own protected
+     * QueuedJobDescriptor::getJobDir(), so the resolution can never drift from upstream's.
+     */
+    public static function triggerFolder(): string
+    {
+        $method = new \ReflectionMethod(QueuedJobDescriptor::class, 'getJobDir');
+        $method->setAccessible(true);
+
+        return (string) $method->invoke(QueuedJobDescriptor::singleton());
     }
 
     /**
