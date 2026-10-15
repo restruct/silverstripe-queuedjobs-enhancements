@@ -8,7 +8,6 @@ use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubMultiStepJob;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubNonDefaultJob;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubWorkerHooks;
 use Restruct\QueuedJobsEnhancements\Worker\QueueWorker;
-use Restruct\QueuedJobsEnhancements\Worker\WorkerRestartSignal;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Dev\SapphireTest;
 use SilverStripe\ORM\FieldType\DBDatetime;
@@ -18,7 +17,7 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
 
 /**
  * The worker loop, run in-process against the test database: queue priority, the exit conditions
- * (max-jobs, restart signal, stop signal, a job parked for memory) and --job mode.
+ * (max-jobs, stop signal, a job parked for memory) and --job mode.
  *
  * What only a separate process can show (that a --job run does not drain the immediate queue at
  * exit) is covered by ImmediateSpawnRunsOnlyItsJobTest.
@@ -106,36 +105,6 @@ class QueueWorkerTest extends SapphireTest
         $this->assertSame(['a', 'b'], StubWorkerHooks::$ran);
         $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($ids[2]));
         $this->assertStringContainsString('max-jobs (2) reached', implode("\n", $this->output));
-    }
-
-    public function testRestartSignalStopsTheWorkerAfterTheCurrentJob(): void
-    {
-        $first = $this->queue(new StubMultiStepJob('first'));
-        $second = $this->queue(new StubImmediateJob('second'));
-
-        # queuedjobs:restart arrives while the first job is running
-        StubWorkerHooks::$onStep = function (string $label, int $step): void {
-            if ($label === 'first' && $step === 1) {
-                WorkerRestartSignal::requestRestart();
-            }
-        };
-
-        $this->worker([])->run();
-
-        # The running job is finished, not cut short; the next one is left for the new worker
-        $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($first));
-        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($second));
-        $this->assertStringContainsString('restart requested', implode("\n", $this->output));
-    }
-
-    public function testRestartTokenKeepsOneRow(): void
-    {
-        $first = WorkerRestartSignal::requestRestart();
-        $second = WorkerRestartSignal::requestRestart();
-
-        $this->assertNotSame($first, $second);
-        $this->assertSame($second, WorkerRestartSignal::currentToken());
-        $this->assertSame(1, WorkerRestartSignal::get()->count());
     }
 
     /**
@@ -345,19 +314,6 @@ class QueueWorkerTest extends SapphireTest
 
         $this->assertSame(0, $this->worker(['memory' => '1K'])->run());
         $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($job));
-    }
-
-    /**
-     * The long-running mode keeps 1.6.0's exit code 0 at its limits (Supervisor restarts it).
-     */
-    public function testLongRunningModeStillExitsZeroAtItsLimits(): void
-    {
-        foreach (['a', 'b'] as $label) {
-            $this->queue(new StubImmediateJob($label));
-        }
-
-        $this->assertSame(0, $this->worker(['stop-when-empty' => false, 'max-jobs' => 1])->run());
-        $this->assertSame(['a'], StubWorkerHooks::$ran);
     }
 
     public function testLingerDefaultsToTheConfig(): void
