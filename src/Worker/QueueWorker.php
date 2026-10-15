@@ -3,6 +3,7 @@
 namespace Restruct\QueuedJobsEnhancements\Worker;
 
 use InvalidArgumentException;
+use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Config\Configurable;
 use SilverStripe\Core\Injector\Injectable;
@@ -43,6 +44,9 @@ use Throwable;
  * EXIT_MORE_WORK when it stopped early after running jobs, with work possibly left (max-jobs,
  * max-time, memory, or a job parked as Waiting). A stop signal (SIGTERM/SIGINT/SIGQUIT) exits 0:
  * the runner was asked to go away.
+ *
+ * After each job it ran, the runner deletes upstream's trigger file `queuedjob-<ID>` of that job
+ * (see deleteTriggerFile()).
  *
  * Health checks and default jobs are NOT run here: they belong to ProcessJobQueueTask's runQueue(),
  * which the existing cron keeps calling. The worker is an addition to that cron, not a replacement.
@@ -345,8 +349,34 @@ class QueueWorker
             $this->output(sprintf('Job #%d failed to run: %s', $jobId, $e->getMessage()));
         }
 
+        # Whatever the outcome (complete, broken, or parked Waiting), see the method
+        $this->deleteTriggerFile($jobId);
+
         $this->jobsRun++;
         $this->resetState($originalUser);
+    }
+
+    /**
+     * Delete upstream's trigger file `<getJobDir()>/queuedjob-<ID>` of a job this runner has run.
+     *
+     * QueuedJobDescriptor::activateOnQueue() writes it for every IMMEDIATE job while
+     * QueuedJobService.use_shutdown_function is false, for an inotify watcher to react to, and
+     * upstream only deletes it when the job completes (cleanupJob()). The drain spawn does not need
+     * the file, and a broken job's file would stay behind for good (a parked one's until the job
+     * completes). So it is deleted after every run, whatever the outcome: a job parked as Waiting is
+     * found again in the DATABASE by the next runner (getNextPendingJob()), never through its file.
+     * Files of jobs this runner did not run are left alone.
+     *
+     * Quiet: a missing file is normal (with use_shutdown_function true none is written), and a
+     * failure here must never stop the runner.
+     */
+    protected function deleteTriggerFile(int $jobId): void
+    {
+        try {
+            @unlink(ImmediateJobRunner::triggerFolder() . '/queuedjob-' . $jobId);
+        } catch (Throwable $e) {
+            # e.g. the job folder cannot be created; the file, if any, is harmless
+        }
     }
 
     /**
