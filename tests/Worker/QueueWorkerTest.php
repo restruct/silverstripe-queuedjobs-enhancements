@@ -315,11 +315,14 @@ class QueueWorkerTest extends SapphireTest
     }
 
     /**
-     * A stop signal after a job step parks that job; one-shot mode reports work left.
+     * A stop signal after a job step parks that job. One-shot mode exits 0 all the same: the runner
+     * was asked to go away, so the drain wrapper must not start a replacement (mic's decision,
+     * 2026-10-15; it was EXIT_MORE_WORK before). The parked job waits for the next dispatch.
      */
-    public function testOneShotStopSignalExitsMoreWork(): void
+    // public function testOneShotStopSignalExitsMoreWork(): void  // old name: a stop signal returned EXIT_MORE_WORK
+    public function testOneShotStopSignalExitsZero(): void
     {
-        $this->queue(new StubMultiStepJob('long'));
+        $job = $this->queue(new StubMultiStepJob('long'));
         $worker = $this->worker([]);
         StubWorkerHooks::$onStep = function (string $label, int $step) use ($worker): void {
             if ($step === 1) {
@@ -327,7 +330,9 @@ class QueueWorkerTest extends SapphireTest
             }
         };
 
-        $this->assertSame(QueueWorker::EXIT_MORE_WORK, $worker->run());
+        // $this->assertSame(QueueWorker::EXIT_MORE_WORK, $worker->run());  // old: a stop signal meant "start another runner"
+        $this->assertSame(0, $worker->run());
+        $this->assertSame(QueuedJob::STATUS_WAIT, $this->jobStatus($job));
     }
 
     /**
