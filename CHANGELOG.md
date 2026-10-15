@@ -3,6 +3,46 @@
 All notable changes to this module. Versions before this file existed are described by their
 git tags (1.0.0 to 1.4.0).
 
+## Unreleased
+
+Drain spawn: the immediate queue runs within about a second of a dispatch, with nothing resident.
+
+### Added
+
+- `QueuedJobDescriptorDrainExtension` and `DrainSpawner`: every new descriptor on the `IMMEDIATE`
+  queue (however it was queued) touches a marker and starts `bin/qje-drain.sh` detached. The wrapper
+  takes a lock without waiting, so a burst starts one PHP runner; it runs the worker one-shot on the
+  immediate queue and starts another runner when the marker was touched during the run or the
+  runner exited 75. Marker `.qje-spawn.pending` and lock `.qje-spawn.lock` live in upstream's job
+  folder. Config: `DrainSpawner.enabled` (default true), `php_cli`, `log_file`.
+- CLI php binary for the runner: the `QJE_PHP_CLI` environment variable (or `.env` entry), then
+  `DrainSpawner.php_cli`, then the automatic resolution of 1.6.0. php-fpm is never used.
+- Locking in the wrapper: util-linux `flock` with `-E`, else perl's `flock()` (macOS), else
+  unlocked with a warning.
+- Worker, one-shot mode (`stop-when-empty`): exit code 75 (`QueueWorker::EXIT_MORE_WORK`) when it
+  stops early after running jobs (max-jobs, max-time, memory, restart, a stop signal, a job parked
+  `Waiting`), and `linger` (config `QueueWorker.linger`, default 2 s; option `linger`): keep looking
+  for due jobs every 0.5 s before exiting.
+- `ImmediateJobRunner::triggerFolder()` and `ImmediateJobRunner::cliPhpBinary()`.
+- `tests/shell/qje-drain-test.sh`: the wrapper against a fake runner, with must-fail mutants.
+
+### Changed
+
+- `ImmediateJobRunner::queueAndRun()` queues the job on the `IMMEDIATE` queue
+  (`queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE)`) and lets the drain spawn run it. The
+  per-job `--job=<ID> --max-jobs=1` spawn is gone; jobs queued from the CLI are drained too.
+- Without `exec()` nothing is spawned (logged once per process); the job waits in the `IMMEDIATE`
+  queue for the cron or another runner.
+- A dispatch inside an open database transaction also drains once at the end of the process, so
+  a commit after the runner's linger does not leave the job for the cron.
+
+### Deprecated
+
+- `ImmediateJobRunner.use_immediate_queue` (no effect; use `DrainSpawner.enabled: false` with your
+  own watcher), `use_spawn_lock`, `spawn_lock_file`, `spawn_lock_timeout` and the per-job spawn
+  helpers (`spawnJobProcess()`, `buildSpawnCommand()`, `wrapWithLock()`, `resolveFlockBinary()`,
+  `isDue()`). Kept, unused, until the next major.
+
 ## 1.6.0 (2026-10-12)
 
 A Laravel-style queue worker (#5).
