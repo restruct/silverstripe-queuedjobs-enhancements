@@ -47,8 +47,8 @@ class ImmediateJobRunner
 
     /**
      * @deprecated since the drain spawn: queueAndRun() always queues on the IMMEDIATE queue, so this
-     * setting has no effect any more. A site with its own inotifywait watcher (or a resident worker
-     * on the immediate queue) sets DrainSpawner.enabled: false instead. Kept so existing YAML that
+     * setting has no effect any more. A site with its own inotifywait watcher sets
+     * DrainSpawner.enabled: false instead. Kept so existing YAML that
      * sets it does not break; to be removed in the next major.
      *
      * Up to 1.6.0:

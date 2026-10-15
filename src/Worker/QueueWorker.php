@@ -19,27 +19,30 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
 use Throwable;
 
 /**
- * A long-running queue worker, modelled on Laravel's `queue:work`.
+ * A one-shot draining queue runner, modelled on Laravel's `queue:work --stop-when-empty`: it runs
+ * the due jobs of the given queue(s) in series and exits when they are empty (after a short linger,
+ * see $linger). It is the drain runner that bin/qje-drain.sh starts for the immediate queue (see
+ * DrainSpawner). Since 1.7.0 this is its only mode: the resident (long-running, polling) worker
+ * mode of 1.6.0, its --sleep option and its restart signal (queuedjobs:restart /
+ * QueuedJobsRestartTask, WorkerRestartSignal) were removed.
  *
  * Each pass takes ONE job via upstream's own QueuedJobService::getNextPendingJob() and runs it
  * through QueuedJobService::runJob(), which takes the per-descriptor mutex (grabMutex()), handles
  * RunAs, nests config and parks the job when memory or time runs out. That is exactly the body of
  * QueuedJobService::processJobQueue()'s loop; the worker runs it one job at a time instead of
- * draining the queue in one call, because the checks Laravel makes between jobs (max jobs, restart
- * signal, SIGTERM, memory) need a point between two jobs to run at. Job selection is not
+ * draining the queue in one call, because the checks Laravel makes between jobs (max jobs, SIGTERM,
+ * memory) need a point between two jobs to run at. Job selection is not
  * reimplemented here.
  *
  * Version-neutral: the Silverstripe 5 task (QueuedJobsWorkTask) and the Silverstripe 6 sake command
  * (QueueWorkCommand) only parse their options into the array the constructor takes, and hand in a
  * function to write output lines with.
  *
- * One-shot mode (--stop-when-empty) is also the drain runner that bin/qje-drain.sh starts for the
- * immediate queue (see DrainSpawner). In that mode the exit code tells the wrapper whether to start
- * another runner: 0 when there is nothing left for this runner (queue empty after the linger, queue
- * paused, or it stopped before running any job), EXIT_MORE_WORK when it stopped early after running
- * jobs, with work possibly left (max-jobs, max-time, memory, restart, or a job parked as Waiting).
- * A stop signal (SIGTERM/SIGINT/SIGQUIT) exits 0: the runner was asked to go away. The long-running mode keeps exiting 0 at its limits, as in 1.6.0: Supervisor restarts
- * it either way, and a new exit code there would only change what Supervisor logs.
+ * The exit code tells the wrapper whether to start another runner: 0 when there is nothing left for
+ * this runner (queue empty after the linger, queue paused, or it stopped before running any job),
+ * EXIT_MORE_WORK when it stopped early after running jobs, with work possibly left (max-jobs,
+ * max-time, memory, or a job parked as Waiting). A stop signal (SIGTERM/SIGINT/SIGQUIT) exits 0:
+ * the runner was asked to go away.
  *
  * Health checks and default jobs are NOT run here: they belong to ProcessJobQueueTask's runQueue(),
  * which the existing cron keeps calling. The worker is an addition to that cron, not a replacement.
@@ -63,7 +66,7 @@ class QueueWorker
     public const LINGER_INTERVAL = 0.5;
 
     /**
-     * One-shot mode only: after the queue is found empty, keep looking for a new due job every
+     * After the queue is found empty, keep looking for a new due job every
      * LINGER_INTERVAL seconds for this many seconds before exiting. A job dispatched while the runner
      * is about to exit is then run by this process instead of costing a new boot. 0 disables it.
      * The `linger` option of the task/command overrides this.
@@ -76,27 +79,26 @@ class QueueWorker
     public const DEFAULTS = [
         # comma list, highest priority first
         'queue' => 'immediate',
-        # seconds to wait when every queue is empty
-        'sleep' => 1,
+        // # seconds to wait when every queue is empty
+        // 'sleep' => 1,  // old: the resident worker's polling interval, removed in 1.7.0
         # seconds; 0 = no limit
         'max-time' => 3600,
         # 0 = no limit
         'max-jobs' => 0,
         # null = the QueuedJobService memory_limit (or PHP's memory_limit when that is unset)
         'memory' => null,
-        # run only this descriptor, then exit
+        # run only this descriptor, then exit (used by ImmediateJobRunner's deprecated spawn helpers)
         'job' => null,
-        # exit as soon as every queue is empty (Laravel's --stop-when-empty)
-        'stop-when-empty' => false,
-        # seconds; with stop-when-empty, keep looking for new jobs this long before exiting.
+        // # exit as soon as every queue is empty (Laravel's --stop-when-empty)
+        // 'stop-when-empty' => false,  // old: since 1.7.0 stopping when empty is the only behaviour;
+        // the entry points still accept the flag, because bin/qje-drain.sh passes it
+        # seconds to keep looking for new jobs before exiting when the queue is empty.
         # null = the $linger config (default 2); 0 = exit at once
         'linger' => null,
     ];
 
     /** @var string[] queue type constants (QueuedJob::IMMEDIATE etc), in priority order */
     protected array $queues = [];
-
-    protected float $sleep = 1;
 
     protected int $maxTime = 0;
 
@@ -106,8 +108,6 @@ class QueueWorker
     protected int $memoryLimit = 0;
 
     protected ?int $jobId = null;
-
-    protected bool $stopWhenEmpty = false;
 
     /** @var float seconds; see $linger */
     protected float $lingerSeconds = 0;
@@ -120,14 +120,12 @@ class QueueWorker
 
     protected int $jobsRun = 0;
 
-    /** @var string|null the restart token as it was when this worker started */
-    protected ?string $restartToken = null;
-
     /** @var string|null set by handleSignal(); the worker exits at the next point between jobs */
     protected ?string $signalReason = null;
 
     /**
-     * @param array $options see DEFAULTS; unknown keys are ignored
+     * @param array $options see DEFAULTS; unknown keys (such as the removed sleep and
+     *   stop-when-empty) are ignored
      * @param callable|null $write function (string $message): void
      */
     public function __construct(array $options = [], ?callable $write = null)
@@ -135,14 +133,12 @@ class QueueWorker
         $options = array_merge(static::DEFAULTS, array_filter($options, fn ($value) => $value !== null));
 
         $this->queues = static::parseQueues((string) $options['queue']);
-        $this->sleep = max(0.0, (float) $options['sleep']);
         $this->maxTime = max(0, (int) $options['max-time']);
         $this->maxJobs = max(0, (int) $options['max-jobs']);
         $this->memoryLimit = $options['memory'] !== null && $options['memory'] !== ''
             ? static::parseMemory((string) $options['memory'])
             : static::serviceMemoryLimit();
         $this->jobId = $options['job'] !== null && $options['job'] !== '' ? static::parseJobId((string) $options['job']) : null;
-        $this->stopWhenEmpty = (bool) $options['stop-when-empty'];
         $linger = $options['linger'] !== null && $options['linger'] !== ''
             ? $options['linger']
             : static::config()->get('linger');
@@ -153,8 +149,8 @@ class QueueWorker
     }
 
     /**
-     * Run until a limit is reached, a restart or stop signal arrives, or (with --job) the one job
-     * has run. Returns a process exit code.
+     * Run until the queues are empty (after the linger), a limit is reached, a stop signal arrives,
+     * or (with --job) the one job has run. Returns a process exit code (see the class doc).
      *
      * Entry points must not touch QueuedJobService before calling this (see disableShutdownDrain());
      * anything they need to do with the service, such as adding a log handler, goes in $onServiceReady.
@@ -171,7 +167,6 @@ class QueueWorker
             $onServiceReady($service);
         }
         $this->startedAt = DBDatetime::now()->getTimestamp();
-        $this->restartToken = WorkerRestartSignal::currentToken();
         $this->registerSignalHandlers();
 
         if ($this->jobId !== null) {
@@ -195,38 +190,30 @@ class QueueWorker
                 return $this->earlyStopExitCode();
             }
 
-            # Paused queue: start nothing, but keep checking for stop conditions
+            # Paused queue: start nothing. Nothing can be run, which is the same as an empty queue;
+            # the jobs stay queued for the next dispatch or the cron once the queue is unpaused.
             if ($service->isMaintenanceLockActive()) {
-                # Nothing can be run, which for --stop-when-empty is the same as an empty queue
-                if ($this->stopWhenEmpty) {
-                    $this->output(sprintf('Worker stopping after %d job(s): queue paused (maintenance lock)', $this->jobsRun));
-                    return 0;
-                }
-                $this->idle();
-                continue;
+                $this->output(sprintf('Worker stopping after %d job(s): queue paused (maintenance lock)', $this->jobsRun));
+                return 0;
             }
 
             $descriptor = $this->nextJob($service);
             if (!$descriptor) {
-                if ($this->stopWhenEmpty) {
-                    # Linger: a job queued just after the empty check above would otherwise wait
-                    # for a new runner (a full boot), or be missed if its dispatch found this
-                    # runner's lock still held. Short sleeps, so a due job starts within
-                    # LINGER_INTERVAL. stopReason() is checked at the top of every pass, so a
-                    # signal or max-time still ends the linger.
-                    $now = microtime(true);
-                    if ($lingerUntil === null) {
-                        $lingerUntil = $now + $this->lingerSeconds;
-                    }
-                    if ($now < $lingerUntil) {
-                        usleep((int) round(min(static::LINGER_INTERVAL, $lingerUntil - $now) * 1000000));
-                        continue;
-                    }
-                    $this->output(sprintf('Worker stopping after %d job(s): queue empty', $this->jobsRun));
-                    return 0;
+                # Linger: a job queued just after the empty check above would otherwise wait
+                # for a new runner (a full boot), or be missed if its dispatch found this
+                # runner's lock still held. Short sleeps, so a due job starts within
+                # LINGER_INTERVAL. stopReason() is checked at the top of every pass, so a
+                # signal or max-time still ends the linger.
+                $now = microtime(true);
+                if ($lingerUntil === null) {
+                    $lingerUntil = $now + $this->lingerSeconds;
                 }
-                $this->idle();
-                continue;
+                if ($now < $lingerUntil) {
+                    usleep((int) round(min(static::LINGER_INTERVAL, $lingerUntil - $now) * 1000000));
+                    continue;
+                }
+                $this->output(sprintf('Worker stopping after %d job(s): queue empty', $this->jobsRun));
+                return 0;
             }
             # Found work: the next empty queue starts a fresh linger
             $lingerUntil = null;
@@ -235,8 +222,8 @@ class QueueWorker
 
             # A job left Waiting was parked by runJob() because memory or time ran out (or because
             # we asked it to stop after its step). It needs a fresh process to continue, so this
-            # worker exits; Supervisor starts a new one, which resumes the job first
-            # (getNextPendingJob() returns Waiting jobs before New ones).
+            # runner exits; on EXIT_MORE_WORK the drain wrapper starts a new one, which resumes the
+            # job first (getNextPendingJob() returns Waiting jobs before New ones).
             if ($this->isWaiting((int) $descriptor->ID)) {
                 $this->output(sprintf(
                     'Worker stopping after %d job(s): job #%d was left Waiting (memory/time limit or stop signal)',
@@ -250,8 +237,8 @@ class QueueWorker
     }
 
     /**
-     * Exit code for a stop with work possibly left (a limit, a restart signal, or a parked job; a
-     * stop signal always exits 0). EXIT_MORE_WORK only in one-shot mode, and only when this run got some work done: a
+     * Exit code for a stop with work possibly left (a limit or a parked job; a stop signal always
+     * exits 0). EXIT_MORE_WORK only when this run got some work done: a
      * runner that stops before its first job (e.g. a memory limit already passed at boot) would stop
      * the same way every time, and the drain wrapper would start runners in a tight loop. Its jobs
      * stay queued for the next dispatch or the cron.
@@ -265,7 +252,8 @@ class QueueWorker
             return 0;
         }
         // if ($this->stopWhenEmpty && $this->jobsRun > 0) {  // old: a stop signal also returned EXIT_MORE_WORK
-        if ($this->stopWhenEmpty && $this->jobsRun > 0) {
+        // if ($this->stopWhenEmpty && $this->jobsRun > 0) {  // old: the resident mode exited 0 at its limits
+        if ($this->jobsRun > 0) {
             return static::EXIT_MORE_WORK;
         }
 
@@ -274,7 +262,9 @@ class QueueWorker
 
     /**
      * --job=N: run that one descriptor, if it may run now, then exit. Used by
-     * ImmediateJobRunner's background spawn, so it must never touch any other job.
+     * ImmediateJobRunner's background spawn, so it must never touch any other job. (That spawn,
+     * spawnJobProcess()/buildSpawnCommand(), is deprecated and no longer called by the module since
+     * the drain spawn; this mode is kept for as long as those helpers are.)
      */
     protected function runSingleJob(QueuedJobService $service, int $jobId): int
     {
@@ -379,7 +369,7 @@ class QueueWorker
     }
 
     /**
-     * Why the worker should stop now, or null to carry on. Checked between jobs and while idle.
+     * Why the worker should stop now, or null to carry on. Checked between jobs and while lingering.
      */
     protected function stopReason(): ?string
     {
@@ -397,19 +387,8 @@ class QueueWorker
         if ($this->memoryLimit > 0 && memory_get_peak_usage(false) >= $this->memoryLimit) {
             return sprintf('memory limit (%s) reached', static::humanBytes($this->memoryLimit));
         }
-        if (WorkerRestartSignal::currentToken() !== $this->restartToken) {
-            return 'restart requested (queuedjobs:restart)';
-        }
 
         return null;
-    }
-
-    protected function idle(): void
-    {
-        if ($this->sleep > 0) {
-            # A signal interrupts usleep(), so SIGTERM while idle exits without waiting it out
-            usleep((int) round($this->sleep * 1000000));
-        }
     }
 
     protected function isWaiting(int $jobId): bool

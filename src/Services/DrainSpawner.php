@@ -75,7 +75,7 @@ class DrainSpawner
 
     /**
      * Switch the drain spawn off, e.g. on a site that already runs the immediate queue another way
-     * (a resident queuedjobs:work worker on the immediate queue, or an inotifywait watcher). The
+     * (an inotifywait watcher; up to 1.6.0 also a resident queuedjobs:work worker, removed in 1.7.0). The
      * jobs are queued as IMMEDIATE either way.
      */
     private static bool $enabled = true;
