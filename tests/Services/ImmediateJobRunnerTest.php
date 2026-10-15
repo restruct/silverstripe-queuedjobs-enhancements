@@ -2,10 +2,13 @@
 
 namespace Restruct\QueuedJobsEnhancements\Tests\Services;
 
+use Restruct\QueuedJobsEnhancements\Services\DrainSpawner;
 use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubDefaultJob;
+use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubMultiStepJob;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubNonDefaultJob;
 use SilverStripe\Core\Config\Config;
+use SilverStripe\Core\Injector\Injector;
 use SilverStripe\Dev\SapphireTest;
 use SilverStripe\ORM\FieldType\DBDatetime;
 use SilverStripe\PolyExecution\PolyOutput;
@@ -83,8 +86,11 @@ class ImmediateJobRunnerTest extends SapphireTest
 
         $this->assertNotNull($descriptor);
         $this->assertEquals((int) $member->ID, (int) $descriptor->RunAsID);
-        # StubNonDefaultJob::getJobType() returns QUEUED — no override in this path
-        $this->assertEquals(QueuedJob::QUEUED, $descriptor->JobType);
+        // # StubNonDefaultJob::getJobType() returns QUEUED — no override in this path
+        // $this->assertEquals(QueuedJob::QUEUED, $descriptor->JobType);
+        # Since the drain spawn (mic's design, 2026-10-15) there is one path: queueAndRun() always
+        # queues on IMMEDIATE, whatever the job's own queue, and the drain runs it
+        $this->assertEquals(QueuedJob::IMMEDIATE, $descriptor->JobType);
     }
 
     /**
@@ -249,17 +255,50 @@ class ImmediateJobRunnerTest extends SapphireTest
 
     /**
      * Control for the above: no start time, or one that has passed, still spawns.
+     *
+     * Up to 1.6.0 "spawns" meant spawnJobProcess() for that one job. Since the drain spawn (mic's
+     * design, 2026-10-15) queueAndRun() never calls it: every new IMMEDIATE descriptor starts a
+     * drain instead, which is asserted on with a recording DrainSpawner.
      */
     public function testDueJobsStillSpawn(): void
     {
         Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', false);
         DBDatetime::set_mock_now('2026-10-12 12:00:00');
         RecordingImmediateJobRunner::$spawned = [];
+        $drain = new RecordingDrainSpawner();
+        Injector::inst()->registerService($drain, DrainSpawner::class);
 
         $now = RecordingImmediateJobRunner::queueAndRun(new StubNonDefaultJob());
         $past = RecordingImmediateJobRunner::queueAndRun(new StubDefaultJob(), '2026-10-12 11:59:00');
 
-        $this->assertSame([$now, $past], RecordingImmediateJobRunner::$spawned);
+        // $this->assertSame([$now, $past], RecordingImmediateJobRunner::$spawned);
+        $this->assertSame([], RecordingImmediateJobRunner::$spawned, 'the per-job spawn is gone');
+        $this->assertNotSame($now, $past, 'precondition: two descriptors');
+        $this->assertCount(2, $drain->commands, 'one drain request per new job');
+    }
+
+    /**
+     * queueAndRun() keeps the use_immediate_queue path's guarantees for every caller: JobType
+     * IMMEDIATE (the 4th queueJob() argument), RunAsID left to the job, and a drain requested.
+     * use_immediate_queue itself no longer changes anything.
+     */
+    public function testQueueAndRunQueuesImmediateAndRequestsADrain(): void
+    {
+        $drain = new RecordingDrainSpawner();
+        Injector::inst()->registerService($drain, DrainSpawner::class);
+        $member = $this->createNonFirstMember();
+        $this->logInAs($member);
+
+        foreach ([false, true] as $flag) {
+            Config::modify()->set(ImmediateJobRunner::class, 'use_immediate_queue', $flag);
+            $descriptor = QueuedJobDescriptor::get()->byID(
+                ImmediateJobRunner::queueAndRun(new StubMultiStepJob('flag-' . (int) $flag, QueuedJob::QUEUED))
+            );
+
+            $this->assertSame(QueuedJob::IMMEDIATE, $descriptor->JobType, "use_immediate_queue: {$flag}");
+            $this->assertSame((int) $member->ID, (int) $descriptor->RunAsID);
+        }
+        $this->assertCount(2, $drain->commands);
     }
 
     /**
