@@ -202,10 +202,14 @@ class DrainSpawnerTest extends SapphireTest
         $this->assertStringContainsString(escapeshellarg(DrainSpawner::wrapperPath()), $command);
         $this->assertFileExists(DrainSpawner::wrapperPath());
 
-        # Marker and lock in upstream's job folder, and never a name like a trigger file
+        # Marker and lock in the .qje-spawn/ subfolder of upstream's job folder (mic's decision
+        # 2026-10-15; before, they sat in the job folder itself), and never a name like a trigger file
         $folder = ImmediateJobRunner::triggerFolder();
-        $this->assertStringContainsString(escapeshellarg($folder . '/.qje-spawn.pending'), $command);
-        $this->assertStringContainsString(escapeshellarg($folder . '/.qje-spawn.lock'), $command);
+        // $this->assertStringContainsString(escapeshellarg($folder . '/.qje-spawn.pending'), $command);  // old: in the job folder itself
+        // $this->assertStringContainsString(escapeshellarg($folder . '/.qje-spawn.lock'), $command);  // old: in the job folder itself
+        $this->assertStringContainsString(escapeshellarg($folder . '/.qje-spawn/pending'), $command);
+        $this->assertStringContainsString(escapeshellarg($folder . '/.qje-spawn/lock'), $command);
+        $this->assertDirectoryExists($folder . '/.qje-spawn');
         $this->assertStringNotContainsString('queuedjob-', $command);
 
         if (class_exists(PolyOutput::class)) {
