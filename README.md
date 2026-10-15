@@ -510,8 +510,10 @@ before `startsecs` (default 1) as a failed start and gives up after `startretrie
 **Exit codes in one-shot mode** (`stop-when-empty`): `0` when the queue is empty (after the
 linger), the queue is paused, or it stopped before running any job; `75`
 (`QueueWorker::EXIT_MORE_WORK`) when it stopped early after running jobs, with work possibly left:
-`max-jobs`, `max-time`, `memory`, a restart request, a stop signal, or a job parked as `Waiting`.
-`bin/qje-drain.sh` starts a new runner on `75`. The stop-before-the-first-job case is `0` because it
+`max-jobs`, `max-time`, `memory`, a restart request, or a job parked as `Waiting`.
+`bin/qje-drain.sh` starts a new runner on `75`. A stop signal (SIGTERM/SIGINT/SIGQUIT) exits `0`:
+the runner was asked to go away, so the wrapper does not replace it; a job it left `Waiting` is run
+by the next dispatch or the cron. The stop-before-the-first-job case is `0` because it
 would stop the same way every time, and `75` would make the wrapper loop.
 
 **Combining with the drain spawn (§2).** A resident worker on the immediate queue makes the drain

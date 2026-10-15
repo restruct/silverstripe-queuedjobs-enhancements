@@ -20,8 +20,8 @@ Drain spawn: the immediate queue runs within about a second of a dispatch, with 
 - Locking in the wrapper: util-linux `flock` with `-E`, else perl's `flock()` (macOS), else
   unlocked with a warning.
 - Worker, one-shot mode (`stop-when-empty`): exit code 75 (`QueueWorker::EXIT_MORE_WORK`) when it
-  stops early after running jobs (max-jobs, max-time, memory, restart, a stop signal, a job parked
-  `Waiting`), and `linger` (config `QueueWorker.linger`, default 2 s; option `linger`): keep looking
+  stops early after running jobs (max-jobs, max-time, memory, restart, a job parked `Waiting`; a stop
+  signal exits 0), and `linger` (config `QueueWorker.linger`, default 2 s; option `linger`): keep looking
   for due jobs every 0.5 s before exiting.
 - `ImmediateJobRunner::triggerFolder()` and `ImmediateJobRunner::cliPhpBinary()`.
 - `tests/shell/qje-drain-test.sh`: the wrapper against a fake runner, with must-fail mutants.

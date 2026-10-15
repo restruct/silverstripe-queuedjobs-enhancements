@@ -37,8 +37,8 @@ use Throwable;
  * immediate queue (see DrainSpawner). In that mode the exit code tells the wrapper whether to start
  * another runner: 0 when there is nothing left for this runner (queue empty after the linger, queue
  * paused, or it stopped before running any job), EXIT_MORE_WORK when it stopped early after running
- * jobs, with work possibly left (max-jobs, max-time, memory, restart, a stop signal, or a job parked
- * as Waiting). The long-running mode keeps exiting 0 at its limits, as in 1.6.0: Supervisor restarts
+ * jobs, with work possibly left (max-jobs, max-time, memory, restart, or a job parked as Waiting).
+ * A stop signal (SIGTERM/SIGINT/SIGQUIT) exits 0: the runner was asked to go away. The long-running mode keeps exiting 0 at its limits, as in 1.6.0: Supervisor restarts
  * it either way, and a new exit code there would only change what Supervisor logs.
  *
  * Health checks and default jobs are NOT run here: they belong to ProcessJobQueueTask's runQueue(),
@@ -250,14 +250,21 @@ class QueueWorker
     }
 
     /**
-     * Exit code for a stop with work possibly left (a limit, a restart or stop signal, or a parked
-     * job). EXIT_MORE_WORK only in one-shot mode, and only when this run got some work done: a
+     * Exit code for a stop with work possibly left (a limit, a restart signal, or a parked job; a
+     * stop signal always exits 0). EXIT_MORE_WORK only in one-shot mode, and only when this run got some work done: a
      * runner that stops before its first job (e.g. a memory limit already passed at boot) would stop
      * the same way every time, and the drain wrapper would start runners in a tight loop. Its jobs
      * stay queued for the next dispatch or the cron.
      */
     protected function earlyStopExitCode(): int
     {
+        # A stop signal means someone wants this runner gone (a deploy, a manual stop, Supervisor).
+        # EXIT_MORE_WORK would make the drain wrapper start a new runner at once, possibly from an
+        # old release's paths. A job the signal left Waiting is run by the next dispatch or the cron.
+        if ($this->signalReason !== null) {
+            return 0;
+        }
+        // if ($this->stopWhenEmpty && $this->jobsRun > 0) {  // old: a stop signal also returned EXIT_MORE_WORK
         if ($this->stopWhenEmpty && $this->jobsRun > 0) {
             return static::EXIT_MORE_WORK;
         }
