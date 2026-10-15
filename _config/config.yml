@@ -3,6 +3,10 @@ Name: queuedjobs-enhancements
 After:
   - '#queuedjobsettings'
 ---
+# DEPRECATED, no effect since the drain spawn: ImmediateJobRunner::queueAndRun() always queues on
+# the IMMEDIATE queue now, and the drain spawn (below) runs it. A site with its own inotifywait
+# watcher sets DrainSpawner.enabled: false instead. Up to 1.6.0 the comment read:
+#
 # ImmediateJobRunner: set true if inotifywait is running (uses IMMEDIATE queue instead of CLI spawn)
 #
 # NOTE: this also requires QueuedJobService.use_shutdown_function: false, otherwise no

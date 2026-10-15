@@ -16,6 +16,16 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
 /**
  * Queue a job AND trigger immediate execution — no waiting for cron.
  *
+ * Since the drain spawn, queueAndRun() queues the job on the IMMEDIATE queue and nothing else:
+ * QueuedJobDescriptorDrainExtension starts the background drain (DrainSpawner, bin/qje-drain.sh)
+ * for every new IMMEDIATE job, whoever queued it. queueAndRun() is kept for existing callers, and
+ * is the same as `queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE)`. The spawn helpers
+ * below (spawnJobProcess(), buildSpawnCommand(), wrapWithLock(), the use_spawn_lock settings) are
+ * no longer used and are deprecated; resolveCliPhpBinary() and triggerFolder() are used by
+ * DrainSpawner.
+ *
+ * Up to 1.6.0 (no longer applies):
+ *
  * Detection order:
  *   1. If `use_immediate_queue` config is true → queue as QueuedJob::IMMEDIATE
  *      (for projects with inotifywait set up, which handles sub-second execution)
@@ -36,6 +46,12 @@ class ImmediateJobRunner
     use Injectable;
 
     /**
+     * @deprecated since the drain spawn: queueAndRun() always queues on the IMMEDIATE queue, so this
+     * setting has no effect any more. A site with its own inotifywait watcher (or a resident worker
+     * on the immediate queue) sets DrainSpawner.enabled: false instead. Kept so existing YAML that
+     * sets it does not break; to be removed in the next major.
+     *
+     * Up to 1.6.0:
      * Set true if inotifywait (or similar) is monitoring the IMMEDIATE queue.
      * When true, jobs are queued as QueuedJob::IMMEDIATE instead of spawning a CLI process.
      *
@@ -45,6 +61,9 @@ class ImmediateJobRunner
     private static bool $use_immediate_queue = false;
 
     /**
+     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
+     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
+     *
      * Serialise spawned runners behind a `flock` lock. Without this, a burst of dispatches
      * forks an unbounded number of PHP processes, each bootstrapping the whole framework.
      * Silently ignored when no flock binary exists (e.g. macOS).
@@ -52,11 +71,17 @@ class ImmediateJobRunner
     private static bool $use_spawn_lock = true;
 
     /**
+     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
+     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
+     *
      * Lock file for the above. Relative paths resolve under TEMP_PATH.
      */
     private static string $spawn_lock_file = 'queuedjobs-enhancements-spawn.lock';
 
     /**
+     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
+     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
+     *
      * Seconds a spawned runner waits for the lock before giving up (the job stays queued,
      * so cron still runs it). 0 or less means "fail immediately" (flock -n).
      */
@@ -69,57 +94,72 @@ class ImmediateJobRunner
      */
     public static function queueAndRun(QueuedJob $job, ?string $startAfter = null): int
     {
-        $service = QueuedJobService::singleton();
+        # Since the drain spawn: the job is always queued on the IMMEDIATE queue, and
+        # QueuedJobDescriptorDrainExtension starts the background drain (bin/qje-drain.sh via
+        # DrainSpawner) as soon as the descriptor row is written. That replaces both paths below:
+        # the per-job `--job=<ID>` spawn (one PHP process per job, unbounded during a burst, and no
+        # spawn at all from the CLI) and use_immediate_queue (which relied on an inotify watcher and
+        # QueuedJobService.use_shutdown_function: false). A future $startAfter needs no check here:
+        # the drain runner's getNextPendingJob() skips a job that is not due, and the cron picks it up
+        # later. queueJob() is ($job, $startAfter, $userId, $queueName): the queue is the FOURTH
+        # argument (see the old code below for what passing it third did).
+        return QueuedJobService::singleton()->queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE);
 
-        # If inotifywait is set up, use IMMEDIATE queue — the existing
-        # infrastructure handles sub-second execution already
-        if (static::singleton()->config()->get('use_immediate_queue')) {
-            # queueJob() is ($job, $startAfter, $userId, $queueName) — the queue override is
-            # the FOURTH param. Passing it third assigned the queue constant to $userId, which
-            # (a) left JobType at $job->getJobType() so the IMMEDIATE override never applied, and
-            # (b) forced RunAsID to Member ID 1, bypassing the job's own getRunAsMemberID().
-            // return $service->queueJob($job, $startAfter, QueuedJob::IMMEDIATE);  // old: queue landed in $userId
-            $descriptorId = $service->queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE);
-
-            # The trigger file that inotifywait watches is only written when BOTH
-            # JobType === IMMEDIATE *and* QueuedJobService.use_shutdown_function is false
-            # (see QueuedJobDescriptor::activateOnQueue()). That config defaults to TRUE, so
-            # without this warning the job silently degrades to "picked up on the next cron
-            # tick" — slower than the CLI-spawn path this option replaced.
-            if (Config::inst()->get(QueuedJobService::class, 'use_shutdown_function')) {
-                static::log(sprintf(
-                    'use_immediate_queue is on, but QueuedJobService.use_shutdown_function is still true, '
-                    . 'so no trigger file was written for job #%d and no watcher can pick it up. '
-                    . 'Set use_shutdown_function: false and run an inotifywait watcher, '
-                    . 'or turn off use_immediate_queue to fall back to CLI spawn.',
-                    $descriptorId
-                ));
-            }
-
-            return $descriptorId;
-        }
-
-        # Queue normally first (safety net — cron picks it up if spawn fails)
-        $descriptorId = $service->queueJob($job, $startAfter);
-
-        # Spawn background CLI process to run this specific job - but only when it is due.
-        # The spawned process runs it through QueuedJobService::runJob(), which never looks at
-        # StartAfter (only getNextPendingJob() does), so spawning for a future start ran the job
-        # straight away, ignoring the requested time. A future job is left to the queue runner,
-        # which picks it up once StartAfter has passed.
-        # The start time is read back from the DESCRIPTOR, not taken from $startAfter: queueJob()
-        # returns an existing New/Initialising descriptor with the same signature instead of
-        # creating one, and that one may carry a future StartAfter of its own.
-        // static::spawnJobProcess($descriptorId);  // old: spawned regardless of $startAfter
-        $descriptor = QueuedJobDescriptor::get()->byID($descriptorId);
-        if (static::isDue($descriptor ? $descriptor->StartAfter : $startAfter)) {
-            static::spawnJobProcess($descriptorId);
-        }
-
-        return $descriptorId;
+        # old (1.6.0), kept for reference:
+        // $service = QueuedJobService::singleton();
+        //
+        // # If inotifywait is set up, use IMMEDIATE queue — the existing
+        // # infrastructure handles sub-second execution already
+        // if (static::singleton()->config()->get('use_immediate_queue')) {
+        //     # queueJob() is ($job, $startAfter, $userId, $queueName) — the queue override is
+        //     # the FOURTH param. Passing it third assigned the queue constant to $userId, which
+        //     # (a) left JobType at $job->getJobType() so the IMMEDIATE override never applied, and
+        //     # (b) forced RunAsID to Member ID 1, bypassing the job's own getRunAsMemberID().
+        //     // return $service->queueJob($job, $startAfter, QueuedJob::IMMEDIATE);  // old: queue landed in $userId
+        //     $descriptorId = $service->queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE);
+        //
+        //     # The trigger file that inotifywait watches is only written when BOTH
+        //     # JobType === IMMEDIATE *and* QueuedJobService.use_shutdown_function is false
+        //     # (see QueuedJobDescriptor::activateOnQueue()). That config defaults to TRUE, so
+        //     # without this warning the job silently degrades to "picked up on the next cron
+        //     # tick" — slower than the CLI-spawn path this option replaced.
+        //     if (Config::inst()->get(QueuedJobService::class, 'use_shutdown_function')) {
+        //         static::log(sprintf(
+        //             'use_immediate_queue is on, but QueuedJobService.use_shutdown_function is still true, '
+        //             . 'so no trigger file was written for job #%d and no watcher can pick it up. '
+        //             . 'Set use_shutdown_function: false and run an inotifywait watcher, '
+        //             . 'or turn off use_immediate_queue to fall back to CLI spawn.',
+        //             $descriptorId
+        //         ));
+        //     }
+        //
+        //     return $descriptorId;
+        // }
+        //
+        // # Queue normally first (safety net — cron picks it up if spawn fails)
+        // $descriptorId = $service->queueJob($job, $startAfter);
+        //
+        // # Spawn background CLI process to run this specific job - but only when it is due.
+        // # The spawned process runs it through QueuedJobService::runJob(), which never looks at
+        // # StartAfter (only getNextPendingJob() does), so spawning for a future start ran the job
+        // # straight away, ignoring the requested time. A future job is left to the queue runner,
+        // # which picks it up once StartAfter has passed.
+        // # The start time is read back from the DESCRIPTOR, not taken from $startAfter: queueJob()
+        // # returns an existing New/Initialising descriptor with the same signature instead of
+        // # creating one, and that one may carry a future StartAfter of its own.
+        // // static::spawnJobProcess($descriptorId);  // old: spawned regardless of $startAfter
+        // $descriptor = QueuedJobDescriptor::get()->byID($descriptorId);
+        // if (static::isDue($descriptor ? $descriptor->StartAfter : $startAfter)) {
+        //     static::spawnJobProcess($descriptorId);
+        // }
+        //
+        // return $descriptorId;
     }
 
     /**
+     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
+     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
+     *
      * Is a job with this StartAfter due now? Null (no start time) is due. A value strtotime()
      * cannot parse is treated as due too, which keeps the behaviour from before this check
      * existed rather than silently never spawning.
@@ -139,6 +179,9 @@ class ImmediateJobRunner
     }
 
     /**
+     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
+     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
+     *
      * Spawn a background CLI process to execute a specific queued job.
      * Best-effort: logs warning on failure, job stays queued for cron.
      */
@@ -163,6 +206,9 @@ class ImmediateJobRunner
     }
 
     /**
+     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
+     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
+     *
      * Build the shell command that runs a single queued job in a detached process.
      * Returns null when the command cannot be built (job then waits for cron).
      *
@@ -301,6 +347,9 @@ class ImmediateJobRunner
     }
 
     /**
+     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
+     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
+     *
      * Prefix a command with `flock` so at most one spawned runner executes at a time.
      * Returns the command unchanged when locking is disabled or flock is unavailable.
      */
@@ -346,6 +395,9 @@ class ImmediateJobRunner
     }
 
     /**
+     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
+     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
+     *
      * Locate the util-linux `flock` binary, or null when it is not installed.
      */
     protected static function resolveFlockBinary(): ?string
