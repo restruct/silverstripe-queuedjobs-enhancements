@@ -198,9 +198,10 @@ Restruct\QueuedJobsEnhancements\Worker\QueueWorker:
 QJE_PHP_CLI="/usr/bin/php8.3"
 ```
 
-The marker (`.qje-spawn.pending`) and the lock (`.qje-spawn.lock`) live in upstream's job folder
-(`QueuedJobService.cache_dir`, relative under `TEMP_PATH`; `ImmediateJobRunner::triggerFolder()`),
-next to the `queuedjob-<ID>` trigger files. `QueuedJobService.use_shutdown_function` is left at
+The marker (`.qje-spawn/pending`) and the lock (`.qje-spawn/lock`) live in a subfolder of
+upstream's job folder (`QueuedJobService.cache_dir`, relative under `TEMP_PATH`;
+`ImmediateJobRunner::triggerFolder()`), so they follow the same configuration as the
+`queuedjob-<ID>` trigger files while a watcher on the job folder itself never sees them. `QueuedJobService.use_shutdown_function` is left at
 upstream's default; the drain does not depend on it, and the runner switches it off for its own
 process.
 
@@ -214,11 +215,10 @@ at its exit, or from the cron.
 drain: the runner would boot against the site's real database from `.env`.
 
 **Running `inotifywait` as well?** Set `DrainSpawner.enabled: false`, or the immediate queue is run
-twice over (harmless, through upstream's mutex, but double the processes). The marker is touched on
-every dispatch, so a watcher on the job folder also sees `.qje-spawn.pending`: on Silverstripe 6
-`ProcessJobQueueTask --job=.qje-spawn.pending` rejects it ("job must be the ID of a job
-descriptor"); on Silverstripe 5 it throws "spawn.pending is invalid", which is logged as an error,
-and runs nothing else.
+twice over (harmless, through upstream's mutex, but double the processes). The marker sits in the
+`.qje-spawn/` subfolder so that upstream's (non-recursive) inotifywait recipe does not see it being
+touched: in the job folder itself it made the recipe run `ProcessJobQueueTask job=<marker name>`,
+which Silverstripe 6 rejects and Silverstripe 5 logs as an error.
 
 > **History.** Up to 1.6.0 `queueAndRun()` spawned one process per job (`queuedjobs:work --job=<ID>
 > --max-jobs=1`, before that `ProcessJobQueueTask job=queuedjob-<ID>`, which also drained the whole

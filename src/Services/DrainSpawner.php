@@ -57,13 +57,21 @@ class DrainSpawner
     public const ENV_PHP_CLI = 'QJE_PHP_CLI';
 
     /**
-     * Marker and lock file names, inside upstream's job folder (QueuedJobDescriptor::getJobDir(),
-     * the folder of the `queuedjob-<ID>` trigger files). Dot files, so a glob over the trigger files
-     * does not pick them up.
+     * Marker and lock file names. They live in SPAWN_FOLDER, a subfolder of upstream's job folder
+     * (QueuedJobDescriptor::getJobDir(), the folder of the `queuedjob-<ID>` trigger files), so the
+     * path follows QueuedJobService.cache_dir exactly as upstream's trigger files do, but a watcher on
+     * the job folder itself (upstream's inotifywait recipe, `--event attrib`, not recursive) never
+     * sees the marker being touched. In the job folder itself, every dispatch made that recipe run
+     * `ProcessJobQueueTask job=.qje-spawn.pending`, which on Silverstripe 5 logs an ERROR (mic's
+     * decision, 2026-10-15).
      */
-    public const MARKER_FILE = '.qje-spawn.pending';
+    // public const MARKER_FILE = '.qje-spawn.pending';  // old: directly in the job folder
+    // public const LOCK_FILE = '.qje-spawn.lock';  // old: directly in the job folder
+    public const SPAWN_FOLDER = '.qje-spawn';
 
-    public const LOCK_FILE = '.qje-spawn.lock';
+    public const MARKER_FILE = 'pending';
+
+    public const LOCK_FILE = 'lock';
 
     /**
      * Switch the drain spawn off, e.g. on a site that already runs the immediate queue another way
@@ -261,14 +269,31 @@ class DrainSpawner
         return (bool) preg_match('#(^|/)(php-fpm[^/]*|php[0-9.]*-fpm)$#', trim($binary));
     }
 
+    /**
+     * The folder of the marker and the lock (see SPAWN_FOLDER), created when it is missing. The
+     * job folder itself is created by upstream's getJobDir() (through triggerFolder()).
+     */
+    public function spawnFolder(): string
+    {
+        $folder = ImmediateJobRunner::triggerFolder() . '/' . static::SPAWN_FOLDER;
+        if (!is_dir($folder)) {
+            # @: two processes may create it at the same moment; is_dir() below is the real check
+            @mkdir($folder, 0775, true);
+        }
+
+        return $folder;
+    }
+
     public function markerPath(): string
     {
-        return ImmediateJobRunner::triggerFolder() . '/' . static::MARKER_FILE;
+        // return ImmediateJobRunner::triggerFolder() . '/' . static::MARKER_FILE;  // old: in the job folder itself
+        return $this->spawnFolder() . '/' . static::MARKER_FILE;
     }
 
     public function lockPath(): string
     {
-        return ImmediateJobRunner::triggerFolder() . '/' . static::LOCK_FILE;
+        // return ImmediateJobRunner::triggerFolder() . '/' . static::LOCK_FILE;  // old: in the job folder itself
+        return $this->spawnFolder() . '/' . static::LOCK_FILE;
     }
 
     public static function wrapperPath(): string

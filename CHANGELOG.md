@@ -13,8 +13,8 @@ Drain spawn: the immediate queue runs within about a second of a dispatch, with 
   queue (however it was queued) touches a marker and starts `bin/qje-drain.sh` detached. The wrapper
   takes a lock without waiting, so a burst starts one PHP runner; it runs the worker one-shot on the
   immediate queue and starts another runner when the marker was touched during the run or the
-  runner exited 75. Marker `.qje-spawn.pending` and lock `.qje-spawn.lock` live in upstream's job
-  folder. Config: `DrainSpawner.enabled` (default true), `php_cli`, `log_file`.
+  runner exited 75. Marker `.qje-spawn/pending` and lock `.qje-spawn/lock` live in a subfolder
+  of upstream's job folder. Config: `DrainSpawner.enabled` (default true), `php_cli`, `log_file`.
 - CLI php binary for the runner: the `QJE_PHP_CLI` environment variable (or `.env` entry), then
   `DrainSpawner.php_cli`, then the automatic resolution of 1.6.0. php-fpm is never used.
 - Locking in the wrapper: util-linux `flock` with `-E`, else perl's `flock()` (macOS), else
