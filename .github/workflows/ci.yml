@@ -171,6 +171,18 @@ jobs:
             timeout 120 vendor/bin/sake queuedjobs:work --stop-when-empty
           fi
 
+  shell:
+    # bin/qje-drain.sh against a fake runner: no PHP or database. ubuntu-latest has util-linux
+    # flock and perl, so both lock variants run here (macOS dev machines only have perl).
+    name: Drain wrapper (bash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Wrapper tests
+        run: bash tests/shell/qje-drain-test.sh
+      - name: Must-fail controls (each broken copy of the wrapper must fail the tests)
+        run: bash tests/shell/qje-drain-test.sh --mutants
+
   lint:
     name: Lint PHP ${{ matrix.php }}
     runs-on: ubuntu-latest
