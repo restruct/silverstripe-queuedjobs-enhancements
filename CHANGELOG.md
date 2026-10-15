@@ -5,7 +5,8 @@ git tags (1.0.0 to 1.4.0).
 
 ## Unreleased
 
-Drain spawn: the immediate queue runs within about a second of a dispatch, with nothing resident.
+To be released as 1.7.0. Drain spawn: the immediate queue runs within about a second of a
+dispatch, with nothing resident. The resident worker mode of 1.6.0 is removed.
 
 ### Added
 
@@ -19,10 +20,13 @@ Drain spawn: the immediate queue runs within about a second of a dispatch, with 
   `DrainSpawner.php_cli`, then the automatic resolution of 1.6.0. php-fpm is never used.
 - Locking in the wrapper: util-linux `flock` with `-E`, else perl's `flock()` (macOS), else
   unlocked with a warning.
-- Worker, one-shot mode (`stop-when-empty`): exit code 75 (`QueueWorker::EXIT_MORE_WORK`) when it
-  stops early after running jobs (max-jobs, max-time, memory, restart, a job parked `Waiting`; a stop
-  signal exits 0), and `linger` (config `QueueWorker.linger`, default 2 s; option `linger`): keep looking
-  for due jobs every 0.5 s before exiting.
+- Drain runner (`queuedjobs:work` / `QueuedJobsWorkTask`, now one-shot only): exit code 75
+  (`QueueWorker::EXIT_MORE_WORK`) when it stops early after running jobs (max-jobs, max-time,
+  memory, a job parked `Waiting`; a stop signal exits 0), and `linger` (config
+  `QueueWorker.linger`, default 2 s; option `linger`): keep looking for due jobs every 0.5 s before
+  exiting.
+- The runner deletes upstream's trigger file `queuedjob-<ID>` of every job it ran, whatever the
+  outcome (complete, broken or parked `Waiting`). Upstream only deletes it for a completed job.
 - `ImmediateJobRunner::triggerFolder()` and `ImmediateJobRunner::cliPhpBinary()`.
 - `tests/shell/qje-drain-test.sh`: the wrapper against a fake runner, with must-fail mutants.
 
@@ -35,6 +39,23 @@ Drain spawn: the immediate queue runs within about a second of a dispatch, with 
   queue for the cron or another runner.
 - A dispatch inside an open database transaction also drains once at the end of the process, so
   a commit after the runner's linger does not leave the job for the cron.
+
+### Removed
+
+- The resident (long-running, polling) worker mode of `queuedjobs:work` / `QueuedJobsWorkTask`,
+  and its `sleep` option. The command is now only the one-shot drain runner. No project used the
+  resident mode (mic's decision, 2026-10-15).
+- `queuedjobs:restart` (`QueueRestartCommand`) and `dev/tasks/QueuedJobsRestartTask`, the restart
+  signal for the deploy script.
+- `WorkerRestartSignal` and its table `QueuedJobsWorkerRestartSignal` (the database build leaves an
+  existing table in place; it can be dropped).
+- `_config/worker.yml`: the `queuedjobs:restart` command registration and the
+  `QueuedJobsRestartTask.is_enabled: false` entry.
+- README: the resident worker, Supervisor/daemon example and restart-on-deploy sections.
+
+The `stop-when-empty` flag is still accepted (the drain wrapper passes it) and has no effect:
+stopping when empty is the only behaviour. The `job` option stays, for the deprecated spawn helpers
+below.
 
 ### Deprecated
 
