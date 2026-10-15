@@ -254,6 +254,52 @@ class QueueWorkerTest extends SapphireTest
     }
 
     /**
+     * The runner deletes upstream's trigger file `queuedjob-<ID>` of every job it ran, whatever the
+     * outcome (here: one complete, one broken). Upstream itself only deletes it for a completed job.
+     * The files of jobs it did not run stay.
+     */
+    public function testDeletesTheTriggerFilesOfTheJobsItRan(): void
+    {
+        # A job folder of this test's own, so no real trigger files are touched
+        $folder = TEMP_PATH . '/qje-trigger-test-' . getmypid();
+        Config::modify()->set(QueuedJobService::class, 'cache_dir', $folder);
+        # Upstream writes the trigger file only while the shutdown drain is off (activateOnQueue())
+        Config::modify()->set(QueuedJobService::class, 'use_shutdown_function', false);
+        StubWorkerHooks::$onStep = function (string $label, int $step): void {
+            if ($label === 'broken') {
+                throw new \RuntimeException('stub job breaks on purpose');
+            }
+        };
+
+        try {
+            $done = $this->queue(new StubImmediateJob('done'));
+            $broken = $this->queue(new StubMultiStepJob('broken'));
+            # Queued last, so max-jobs 2 leaves it alone
+            $notRun = $this->queue(new StubImmediateJob('not-run'));
+            # A file of a job that does not exist at all: not this runner's either
+            touch($folder . '/queuedjob-999999');
+            foreach ([$done, $broken, $notRun] as $id) {
+                $this->assertFileExists($folder . '/queuedjob-' . $id, 'precondition: upstream wrote the trigger file');
+            }
+
+            $this->worker(['max-jobs' => 2])->run();
+
+            $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($done));
+            $this->assertSame(QueuedJob::STATUS_BROKEN, $this->jobStatus($broken));
+            $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($notRun));
+            $this->assertFileDoesNotExist($folder . '/queuedjob-' . $done);
+            $this->assertFileDoesNotExist($folder . '/queuedjob-' . $broken, 'a broken job\'s file must go too');
+            $this->assertFileExists($folder . '/queuedjob-' . $notRun, 'a job the runner did not run keeps its file');
+            $this->assertFileExists($folder . '/queuedjob-999999');
+        } finally {
+            foreach (glob($folder . '/*') ?: [] as $file) {
+                @unlink($file);
+            }
+            @rmdir($folder);
+        }
+    }
+
+    /**
      * One-shot mode (the drain runner of bin/qje-drain.sh): a stop at a limit after running jobs
      * exits EXIT_MORE_WORK, so the wrapper starts another runner for the rest. In 1.6.0 this was 0,
      * and the jobs left behind waited for the next dispatch or the cron.
