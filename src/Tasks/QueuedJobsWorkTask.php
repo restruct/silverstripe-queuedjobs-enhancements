@@ -18,7 +18,9 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  * Usage (run PHP directly, not through the `sake` shell wrapper, so Supervisor's SIGTERM reaches
  * the PHP process):
  *   php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask queue=immediate
- *   ... max-time=3600 max-jobs=0 sleep=1 memory=512M job=123 stop-when-empty=1
+ *   ... max-time=3600 max-jobs=0 sleep=1 memory=512M job=123 stop-when-empty=1 linger=2
+ * With stop-when-empty it is a one-shot runner; exit code 75 means it stopped early with work left
+ * (QueueWorker::EXIT_MORE_WORK).
  * A leading `--` on an option is accepted too (cli-script strips it), so `--queue=immediate` works.
  *
  * Silverstripe 6: `sake queuedjobs:work` (QueueWorkCommand); this task is disabled there.

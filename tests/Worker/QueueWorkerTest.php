@@ -47,9 +47,12 @@ class QueueWorkerTest extends SapphireTest
 
     protected function worker(array $options): TestQueueWorker
     {
-        # sleep 0 and stop-when-empty: a test never waits, and never loops forever
+        # sleep 0 and stop-when-empty: a test never waits, and never loops forever.
+        # linger 0: without it every one-shot run here would wait out the 2 s default linger
+        // return TestQueueWorker::create(
+        //     array_merge(['sleep' => 0, 'stop-when-empty' => true], $options),
         return TestQueueWorker::create(
-            array_merge(['sleep' => 0, 'stop-when-empty' => true], $options),
+            array_merge(['sleep' => 0, 'stop-when-empty' => true, 'linger' => 0], $options),
             function (string $message): void {
                 $this->output[] = $message;
             }
@@ -281,6 +284,131 @@ class QueueWorkerTest extends SapphireTest
         $this->assertFalse(Config::inst()->get(QueuedJobService::class, 'use_shutdown_function'));
     }
 
+    /**
+     * One-shot mode (the drain runner of bin/qje-drain.sh): a stop at a limit after running jobs
+     * exits EXIT_MORE_WORK, so the wrapper starts another runner for the rest. In 1.6.0 this was 0,
+     * and the jobs left behind waited for the next dispatch or the cron.
+     */
+    public function testOneShotMaxJobsExitsMoreWork(): void
+    {
+        foreach (['a', 'b', 'c'] as $label) {
+            $this->queue(new StubImmediateJob($label));
+        }
+
+        $this->assertSame(QueueWorker::EXIT_MORE_WORK, $this->worker(['max-jobs' => 2])->run());
+        # Control: the rest, with no limit, empties the queue and exits 0
+        $this->assertSame(0, $this->worker([])->run());
+        $this->assertSame(['a', 'b', 'c'], StubWorkerHooks::$ran);
+    }
+
+    /**
+     * A job parked as Waiting (memory) needs a fresh process to continue: one-shot mode says so.
+     */
+    public function testOneShotParkedJobExitsMoreWork(): void
+    {
+        $job = $this->queue(new StubMultiStepJob('heavy'));
+        Config::modify()->set(QueuedJobService::class, 'memory_limit', '1K');
+
+        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($job), 'precondition');
+        $this->assertSame(QueueWorker::EXIT_MORE_WORK, $this->worker(['memory' => '64G'])->run());
+        $this->assertSame(QueuedJob::STATUS_WAIT, $this->jobStatus($job));
+    }
+
+    /**
+     * A stop signal after a job step parks that job; one-shot mode reports work left.
+     */
+    public function testOneShotStopSignalExitsMoreWork(): void
+    {
+        $this->queue(new StubMultiStepJob('long'));
+        $worker = $this->worker([]);
+        StubWorkerHooks::$onStep = function (string $label, int $step) use ($worker): void {
+            if ($step === 1) {
+                $worker->handleSignal(defined('SIGTERM') ? SIGTERM : 15);
+            }
+        };
+
+        $this->assertSame(QueueWorker::EXIT_MORE_WORK, $worker->run());
+    }
+
+    /**
+     * A runner that stops before its first job would stop the same way every time; EXIT_MORE_WORK
+     * would make the drain wrapper start runners in a tight loop. So it exits 0.
+     */
+    public function testOneShotStopBeforeAnyJobExitsZero(): void
+    {
+        $job = $this->queue(new StubImmediateJob('never'));
+
+        $this->assertSame(0, $this->worker(['memory' => '1K'])->run());
+        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($job));
+    }
+
+    /**
+     * The long-running mode keeps 1.6.0's exit code 0 at its limits (Supervisor restarts it).
+     */
+    public function testLongRunningModeStillExitsZeroAtItsLimits(): void
+    {
+        foreach (['a', 'b'] as $label) {
+            $this->queue(new StubImmediateJob($label));
+        }
+
+        $this->assertSame(0, $this->worker(['stop-when-empty' => false, 'max-jobs' => 1])->run());
+        $this->assertSame(['a'], StubWorkerHooks::$ran);
+    }
+
+    public function testLingerDefaultsToTheConfig(): void
+    {
+        $this->assertEquals(2, Config::inst()->get(QueueWorker::class, 'linger'), 'shipped default');
+
+        Config::modify()->set(QueueWorker::class, 'linger', 7);
+        $property = new \ReflectionProperty(QueueWorker::class, 'lingerSeconds');
+        $property->setAccessible(true);
+        $this->assertSame(7.0, $property->getValue(QueueWorker::create(['stop-when-empty' => true])));
+        # The option wins over the config
+        $this->assertSame(0.5, $property->getValue(QueueWorker::create(['stop-when-empty' => true, 'linger' => '0.5'])));
+    }
+
+    /**
+     * With linger, an empty queue is watched for that long before exiting; with 0 it exits at once.
+     */
+    public function testLingerWaitsBeforeExiting(): void
+    {
+        $start = microtime(true);
+        $this->assertSame(0, $this->worker(['linger' => 1])->run());
+        $lingered = microtime(true) - $start;
+
+        $start = microtime(true);
+        $this->assertSame(0, $this->worker(['linger' => 0])->run());
+        $immediate = microtime(true) - $start;
+
+        $this->assertGreaterThanOrEqual(0.95, $lingered, 'linger 1 must keep looking for about a second');
+        $this->assertLessThan(3.0, $lingered, 'and then exit');
+        $this->assertLessThan(0.5, $immediate, 'linger 0 must exit at once');
+    }
+
+    /**
+     * A job that shows up while the runner lingers is run by that runner. LateJobQueueWorker hides
+     * the queue from the first two looks, as if the job was committed just after the empty check.
+     */
+    public function testLingerRunsAJobThatArrivesLate(): void
+    {
+        $job = $this->queue(new StubImmediateJob('late'));
+
+        $worker = LateJobQueueWorker::create(['stop-when-empty' => true, 'linger' => 2], function (string $message): void {
+            $this->output[] = $message;
+        });
+        $this->assertSame(0, $worker->run());
+        $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($job));
+        $this->assertSame(['late'], StubWorkerHooks::$ran);
+
+        # Control: without linger the same runner exits on the first empty look and the job stays New
+        $other = $this->queue(new StubImmediateJob('missed'));
+        $worker = LateJobQueueWorker::create(['stop-when-empty' => true, 'linger' => 0], function (string $message): void {
+            $this->output[] = $message;
+        });
+        $this->assertSame(0, $worker->run());
+        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($other));
+    }
+
     public function testParsesOptions(): void
     {
         $this->assertSame(
@@ -316,5 +444,23 @@ class TestQueueWorker extends QueueWorker
 {
     protected function registerSignalHandlers(): void
     {
+    }
+}
+
+/**
+ * Sees an empty queue on its first two looks, then the real one: a job that is committed just after
+ * the runner's empty check (see testLingerRunsAJobThatArrivesLate).
+ */
+class LateJobQueueWorker extends TestQueueWorker
+{
+    protected int $looks = 0;
+
+    protected function nextJob(QueuedJobService $service): ?QueuedJobDescriptor
+    {
+        if (++$this->looks <= 2) {
+            return null;
+        }
+
+        return parent::nextJob($service);
     }
 }

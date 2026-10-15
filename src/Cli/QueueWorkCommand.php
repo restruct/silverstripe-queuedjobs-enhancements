@@ -48,7 +48,8 @@ class QueueWorkCommand extends PolyCommand
     {
         return 'Polls the given queue(s) and runs jobs as soon as they are due. Exits cleanly on its limits, '
             . 'on SIGTERM/SIGINT (after the current job step) and after queuedjobs:restart, so run it under '
-            . 'Supervisor with autorestart. Keep the ProcessJobQueueTask crons as a fallback.';
+            . 'Supervisor with autorestart. Keep the ProcessJobQueueTask crons as a fallback. With --stop-when-empty '
+            . 'it is a one-shot runner (the immediate-queue drain): exit 75 means it stopped early with work left.';
     }
 
     public function run(InputInterface $input, PolyOutput $output): int
@@ -65,6 +66,7 @@ class QueueWorkCommand extends PolyCommand
                     'memory' => $input->getOption('memory'),
                     'job' => $input->getOption('job'),
                     'stop-when-empty' => $input->getOption('stop-when-empty'),
+                    'linger' => $input->getOption('linger'),
                 ],
                 function (string $message) use ($output): void {
                     # OUTPUT_RAW: job titles are free text and must not be read as console tags
@@ -97,6 +99,8 @@ class QueueWorkCommand extends PolyCommand
             new InputOption('memory', null, InputOption::VALUE_REQUIRED, 'Exit when peak memory reaches this (e.g. 512M; a bare number is MB). Default: the QueuedJobService memory_limit'),
             new InputOption('job', null, InputOption::VALUE_REQUIRED, 'Run only this job descriptor (ID, or queuedjob-ID), then exit'),
             new InputOption('stop-when-empty', null, InputOption::VALUE_NONE, 'Exit as soon as the queue is empty'),
+            # No default here: an absent option falls back to the QueueWorker.linger config
+            new InputOption('linger', null, InputOption::VALUE_REQUIRED, 'With --stop-when-empty: seconds to keep looking for new jobs before exiting (default: the QueueWorker.linger config, 2; 0 = exit at once)'),
         ];
     }
 }
