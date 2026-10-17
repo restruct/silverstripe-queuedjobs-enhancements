@@ -223,14 +223,16 @@ which Silverstripe 6 rejects and Silverstripe 5 logs as an error.
 > **History.** Up to 1.6.0 `queueAndRun()` spawned one process per job (`queuedjobs:work --job=<ID>
 > --max-jobs=1`, before that `ProcessJobQueueTask job=queuedjob-<ID>`, which also drained the whole
 > immediate queue as it exited), skipped the spawn under the CLI and for a future `$startAfter`, and
-> with `use_immediate_queue: true` relied on an `inotifywait` watcher instead. `use_immediate_queue`
-> is now deprecated and has no effect; `use_spawn_lock`, `spawn_lock_file` and `spawn_lock_timeout`
-> are no longer used.
+> with `use_immediate_queue: true` relied on an `inotifywait` watcher instead. The drain spawn
+> deprecated that per-job spawn, and 1.7.0 removed it: the spawn helpers, the runner's `--job`
+> option and the `use_immediate_queue`, `use_spawn_lock`, `spawn_lock_file` and
+> `spawn_lock_timeout` settings. Nothing reads `use_immediate_queue` any more; a YAML line that
+> sets it can be deleted.
 
 > **Calling `ProcessJobQueueTask` yourself? The `queuedjob-` prefix is mandatory there.** It only
 > enters single-job mode when the `job` parameter contains a dash (on Silverstripe 5, and on 6 up
 > to queuedjobs 6.2.0). A bare `job=42` silently falls through to draining the entire *Queued*
-> queue. The worker's `job` option takes either form.
+> queue. (The runner's own `job` option, which took either form, was removed in 1.7.0.)
 
 ### 3. Default-Job Diagnostics (`$is_default_job`)
 
@@ -429,7 +431,6 @@ php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask qu
 | `max-jobs` | `0` | Exit after this many jobs (`0` = no limit). |
 | `memory` | the `QueuedJobService.memory_limit` | Exit once peak memory reaches this (`512M`, `1G`; a bare number is MB, as in Laravel). |
 | `linger` | `QueueWorker.linger` (2) | Once empty, keep looking for a due job every 0.5 s for this many seconds before exiting. `0` = exit at once. |
-| `job` | | Run only this descriptor (`123` or `queuedjob-123`), then exit. Up to 1.6.0 this is what `ImmediateJobRunner` spawned; only its deprecated spawn helpers still build it. |
 | `stop-when-empty` | | No effect since 1.7.0: stopping when empty is the only behaviour. Still accepted, because `bin/qje-drain.sh` passes it. |
 
 **How it picks jobs.** Each pass calls upstream's own `QueuedJobService::getNextPendingJob()` and
@@ -483,7 +484,9 @@ jobs the runner did not run are left alone.
 > `QueuedJobsRestartTask` for the deploy script and a `QueuedJobsWorkerRestartSignal` table. The
 > drain spawn replaces it. An existing `QueuedJobsWorkerRestartSignal` table is left alone by the
 > database build and can be dropped. A Supervisor program or deploy line that still calls the old
-> commands must be removed: `--sleep` and `queuedjobs:restart` no longer exist.
+> commands must be removed: `--sleep` and `queuedjobs:restart` no longer exist. The single-job
+> `--job=<ID>` mode, which `ImmediateJobRunner` spawned per job up to 1.6.0, was removed in 1.7.0
+> as well.
 
 ## Dev Tasks
 
@@ -540,8 +543,7 @@ be present, so not a dist install):
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
 # Silverstripe 6 (PHPUnit 11): the flush is an environment variable
 SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
-# expected on both: OK (100 tests); 285 assertions on SS5, 286 on SS6 (one test asserts the
-# version-specific spawn command)
+# expected on both: OK (84 tests, 243 assertions)
 
 # The drain wrapper, no PHP or database needed (every lock tool available here); --mutants checks
 # that four broken copies of the wrapper each fail it
@@ -552,9 +554,7 @@ bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-
 CI (`.github/workflows/ci.yml`) runs the suite on Silverstripe 5 (PHP 8.1 and 8.3) and
 Silverstripe 6 (PHP 8.3), then boots each host, builds the database and runs both dev tasks.
 
-The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, the spawn command contract, `flock` wrapping, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion, `--job` mode; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), the spawn running only its own job in a real child process (`ImmediateSpawnRunsOnlyItsJobTest`, with a control showing that the 1.5.0 command drains the immediate queue), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
-
-The `flock` tests stub the binary lookup, so the lock-wrapping and no-flock branches are both exercised on macOS *and* Linux rather than being skipped on whichever platform lacks `flock`.
+The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 
 > **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` — the tests follow this convention deliberately.
 

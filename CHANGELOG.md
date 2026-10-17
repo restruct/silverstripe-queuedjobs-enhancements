@@ -52,17 +52,22 @@ dispatch, with nothing resident. The resident worker mode of 1.6.0 is removed.
 - `_config/worker.yml`: the `queuedjobs:restart` command registration and the
   `QueuedJobsRestartTask.is_enabled: false` entry.
 - README: the resident worker, Supervisor/daemon example and restart-on-deploy sections.
+- The per-job spawn helpers of `ImmediateJobRunner` (`spawnJobProcess()`, `buildSpawnCommand()`,
+  `wrapWithLock()`, `resolveFlockBinary()`, `isDue()`), unused since the drain spawn. Deprecated
+  earlier in this release, removed rather than kept until the next major, because no project uses
+  them (mic's decision, 2026-10-17).
+- The settings `ImmediateJobRunner.use_immediate_queue` (no effect since the drain spawn; a site
+  with its own watcher sets `DrainSpawner.enabled: false`), `use_spawn_lock`, `spawn_lock_file` and
+  `spawn_lock_timeout`, and the `use_immediate_queue` entry in `_config/config.yml`. Nothing reads
+  them any more; a project YAML line that sets one can be deleted.
+- The single-job mode of the runner: the `job` option of `queuedjobs:work` / `QueuedJobsWorkTask`
+  (`QueueWorker::runSingleJob()`, `QueueWorker::parseJobId()`). Only the per-job spawn used it.
+  `sake queuedjobs:work --job=<ID>` is now rejected as an unknown option.
+- Tests of the removed code: the spawn command and `flock` tests, the `--job` and `parseJobId()`
+  tests, and `ImmediateSpawnRunsOnlyItsJobTest`.
 
 The `stop-when-empty` flag is still accepted (the drain wrapper passes it) and has no effect:
-stopping when empty is the only behaviour. The `job` option stays, for the deprecated spawn helpers
-below.
-
-### Deprecated
-
-- `ImmediateJobRunner.use_immediate_queue` (no effect; use `DrainSpawner.enabled: false` with your
-  own watcher), `use_spawn_lock`, `spawn_lock_file`, `spawn_lock_timeout` and the per-job spawn
-  helpers (`spawnJobProcess()`, `buildSpawnCommand()`, `wrapWithLock()`, `resolveFlockBinary()`,
-  `isDue()`). Kept, unused, until the next major.
+stopping when empty is the only behaviour.
 
 ## 1.6.0 (2026-10-12)
 
