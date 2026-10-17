@@ -3,12 +3,10 @@
 namespace Restruct\QueuedJobsEnhancements\Services;
 
 use Psr\Log\LoggerInterface;
-use SilverStripe\Control\Director;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Config\Configurable;
 use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\Core\Injector\Injector;
-use SilverStripe\ORM\FieldType\DBDatetime;
 use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
 use Symbiote\QueuedJobs\Services\QueuedJobService;
@@ -19,10 +17,11 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  * Since the drain spawn, queueAndRun() queues the job on the IMMEDIATE queue and nothing else:
  * QueuedJobDescriptorDrainExtension starts the background drain (DrainSpawner, bin/qje-drain.sh)
  * for every new IMMEDIATE job, whoever queued it. queueAndRun() is kept for existing callers, and
- * is the same as `queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE)`. The spawn helpers
- * below (spawnJobProcess(), buildSpawnCommand(), wrapWithLock(), the use_spawn_lock settings) are
- * no longer used and are deprecated; resolveCliPhpBinary() and triggerFolder() are used by
- * DrainSpawner.
+ * is the same as `queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE)`. The per-job spawn
+ * helpers of 1.6.0 (spawnJobProcess(), buildSpawnCommand(), wrapWithLock(), resolveFlockBinary(),
+ * isDue()) and the use_immediate_queue and use_spawn_lock / spawn_lock_file / spawn_lock_timeout
+ * settings were deprecated by the drain spawn and removed in 1.7.0. What is left besides
+ * queueAndRun() serves DrainSpawner: cliPhpBinary() (the CLI php binary) and triggerFolder().
  *
  * Up to 1.6.0 (no longer applies):
  *
@@ -34,58 +33,11 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  *
  * The job is ALWAYS queued first as a safety net. The spawn is best-effort.
  * This class never replaces or subclasses core QueuedJobs classes.
- *
- * @config bool $use_immediate_queue
- * @config bool $use_spawn_lock
- * @config string $spawn_lock_file
- * @config int $spawn_lock_timeout
  */
 class ImmediateJobRunner
 {
     use Configurable;
     use Injectable;
-
-    /**
-     * @deprecated since the drain spawn: queueAndRun() always queues on the IMMEDIATE queue, so this
-     * setting has no effect any more. A site with its own inotifywait watcher sets
-     * DrainSpawner.enabled: false instead. Kept so existing YAML that
-     * sets it does not break; to be removed in the next major.
-     *
-     * Up to 1.6.0:
-     * Set true if inotifywait (or similar) is monitoring the IMMEDIATE queue.
-     * When true, jobs are queued as QueuedJob::IMMEDIATE instead of spawning a CLI process.
-     *
-     * Requires QueuedJobService.use_shutdown_function: false, otherwise no trigger file
-     * is written and nothing can pick the job up (see queueAndRun()).
-     */
-    private static bool $use_immediate_queue = false;
-
-    /**
-     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
-     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
-     *
-     * Serialise spawned runners behind a `flock` lock. Without this, a burst of dispatches
-     * forks an unbounded number of PHP processes, each bootstrapping the whole framework.
-     * Silently ignored when no flock binary exists (e.g. macOS).
-     */
-    private static bool $use_spawn_lock = true;
-
-    /**
-     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
-     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
-     *
-     * Lock file for the above. Relative paths resolve under TEMP_PATH.
-     */
-    private static string $spawn_lock_file = 'queuedjobs-enhancements-spawn.lock';
-
-    /**
-     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
-     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
-     *
-     * Seconds a spawned runner waits for the lock before giving up (the job stays queued,
-     * so cron still runs it). 0 or less means "fail immediately" (flock -n).
-     */
-    private static int $spawn_lock_timeout = 300;
 
     /**
      * Queue a job and trigger immediate execution.
@@ -157,139 +109,12 @@ class ImmediateJobRunner
     }
 
     /**
-     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
-     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
-     *
-     * Is a job with this StartAfter due now? Null (no start time) is due. A value strtotime()
-     * cannot parse is treated as due too, which keeps the behaviour from before this check
-     * existed rather than silently never spawning.
-     */
-    protected static function isDue(?string $startAfter): bool
-    {
-        if ($startAfter === null || $startAfter === '') {
-            return true;
-        }
-        $timestamp = strtotime($startAfter);
-        if ($timestamp === false) {
-            return true;
-        }
-
-        # DBDatetime::now() rather than time(): honours set_mock_now() in tests, like core does
-        return $timestamp <= DBDatetime::now()->getTimestamp();
-    }
-
-    /**
-     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
-     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
-     *
-     * Spawn a background CLI process to execute a specific queued job.
-     * Best-effort: logs warning on failure, job stays queued for cron.
-     */
-    protected static function spawnJobProcess(int $descriptorId): void
-    {
-        # Don't spawn from CLI — we're likely already in a job runner
-        if (Director::is_cli()) {
-            return;
-        }
-
-        # exec() must be available (not disabled in php.ini)
-        if (!function_exists('exec')) {
-            return;
-        }
-
-        $cmd = static::buildSpawnCommand($descriptorId);
-        if ($cmd === null) {
-            return;
-        }
-
-        exec($cmd);
-    }
-
-    /**
-     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
-     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
-     *
-     * Build the shell command that runs a single queued job in a detached process.
-     * Returns null when the command cannot be built (job then waits for cron).
-     *
-     * Kept separate from spawnJobProcess() so it can be asserted on in tests without
-     * actually shelling out.
-     */
-    protected static function buildSpawnCommand(int $descriptorId): ?string
-    {
-        # Silverstripe 5: use cli-script.php directly - more reliable than the sake shell wrapper
-        # (see SSKB cli-commands profile). Silverstripe 6 removed cli-script.php; its sake is a
-        # PHP script (framework bin/sake, Symfony Console), so it is run with the same PHP binary.
-        # Detected by file rather than by version so the check is the thing we actually need.
-        $frameworkDir = BASE_PATH . '/vendor/silverstripe/framework';
-        $cliScript = $frameworkDir . '/cli-script.php';
-        $sakeScript = $frameworkDir . '/bin/sake';
-        # The spawn runs this module's worker for this ONE job, not ProcessJobQueueTask. Any CLI
-        # process that instantiates QueuedJobService drains the whole IMMEDIATE queue at exit
-        # (its constructor registers onShutdown(); SSKB queuedjobs §12), so `ProcessJobQueueTask
-        # job=queuedjob-<ID>` ran our job and then every other pending immediate job too ("bug 3",
-        # issue #5). The worker switches that drain off for its own process, and in --job mode it
-        # also checks the job's status and StartAfter before running it.
-        if (file_exists($cliScript)) {
-            $script = $cliScript;
-            // # SS5 single-job mode only triggers when the value contains a dash (see below)
-            // $taskArgs = sprintf('dev/tasks/ProcessJobQueueTask job=queuedjob-%d', $descriptorId);
-            $taskArgs = sprintf('dev/tasks/QueuedJobsWorkTask job=%d max-jobs=1', $descriptorId);
-        } elseif (file_exists($sakeScript)) {
-            $script = $sakeScript;
-            // # SS6 accepts "queuedjob-<ID>" on every 6.x (a bare ID only from queuedjobs 6.2.1)
-            // $taskArgs = sprintf('tasks:ProcessJobQueueTask --job=queuedjob-%d', $descriptorId);
-            $taskArgs = sprintf('queuedjobs:work --job=%d --max-jobs=1', $descriptorId);
-        } else {
-            # Was: only cli-script.php was looked for, so every SS6 spawn returned null here
-            // static::log("Cannot spawn job #{$descriptorId}: cli-script.php not found at {$cliScript}");
-            static::log("Cannot spawn job #{$descriptorId}: neither cli-script.php nor bin/sake found in {$frameworkDir}");
-            return null;
-        }
-
-        # Find the CLI PHP binary. PHP_BINARY is only usable when we ARE the cli SAPI — under
-        # php-fpm it points at the FPM daemon binary (/usr/sbin/php-fpmX.Y), which just prints
-        # usage when handed a script and made every spawn a silent no-op (jobs sat New until the
-        # cron runner picked them up; found on a site in prod 2026-07-19). Resolve a real CLI
-        # binary instead, preferring the exact same PHP version.
-        //        $phpBinary = PHP_BINARY ?: 'php';
-        $phpBinary = static::resolveCliPhpBinary();
-
-        # (Applied to the ProcessJobQueueTask spawn up to 1.5.0; the worker takes a bare ID.)
-        # The "queuedjob-" prefix is REQUIRED. ProcessJobQueueTask only enters single-job mode
-        # when the job param contains a dash — `if (($job = $request->getVar('job')) && strpos($job, '-'))`
-        # — taking the part after the dash as the descriptor ID. This matches the `queuedjob-{ID}`
-        # trigger-file names inotifywait passes as `%f`. A bare `job=42` fails that check and falls
-        # through to runQueue('Queued'), draining the ENTIRE queued queue instead of this one job
-        # (and missing the job entirely if it is a LARGE or IMMEDIATE job).
-        // $inner = sprintf(
-        //     // '%s %s dev/tasks/ProcessJobQueueTask job=%d',  // old: bare ID, no dash
-        //     '%s %s dev/tasks/ProcessJobQueueTask job=queuedjob-%d',
-        //     escapeshellarg($phpBinary),
-        //     escapeshellarg($cliScript),
-        //     $descriptorId
-        // );
-        $inner = sprintf(
-            '%s %s %s',
-            escapeshellarg($phpBinary),
-            escapeshellarg($script),
-            $taskArgs
-        );
-
-        # Optionally serialise spawns behind a lock so a burst of dispatches cannot fork an
-        # unbounded number of PHP processes (each one bootstraps the whole framework). This
-        # mirrors what the inotifywait watcher gets for free: `inotifywait … | sh` feeds
-        # commands into a single shell, which runs them one at a time.
-        $inner = static::wrapWithLock($inner);
-
-        # nohup detaches from the parent, /dev/null discards output (without the redirect
-        # PHP's exec() blocks until stdout closes), & backgrounds it.
-        return sprintf('nohup %s > /dev/null 2>&1 &', $inner);
-    }
-
-    /**
-     * Resolve a CLI php binary usable for spawning (see buildSpawnCommand — PHP_BINARY is the
-     * FPM daemon under fpm-fcgi). Preference order: our own binary when we are cli(-server),
+     * Resolve a CLI php binary usable for spawning. PHP_BINARY is only usable when we ARE the cli
+     * SAPI: under php-fpm it points at the FPM daemon binary (/usr/sbin/php-fpmX.Y), which just
+     * prints usage when handed a script and made every spawn of the per-job spawn (removed in 1.7.0)
+     * a silent no-op (jobs sat New until the cron runner picked them up; found on a site in prod
+     * 2026-07-19). So a real CLI binary is resolved instead, preferring the exact same PHP version.
+     * Preference order: our own binary when we are cli(-server),
      * then version-exact `phpX.Y` next to it / in PHP_BINDIR (Debian/Ubuntu layout), then the
      * generic `php` in PHP_BINDIR, then bare `php` from PATH as a last resort.
      */
@@ -344,74 +169,6 @@ class ImmediateJobRunner
         $method->setAccessible(true);
 
         return (string) $method->invoke(QueuedJobDescriptor::singleton());
-    }
-
-    /**
-     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
-     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
-     *
-     * Prefix a command with `flock` so at most one spawned runner executes at a time.
-     * Returns the command unchanged when locking is disabled or flock is unavailable.
-     */
-    protected static function wrapWithLock(string $command): string
-    {
-        $config = static::singleton()->config();
-
-        if (!$config->get('use_spawn_lock')) {
-            return $command;
-        }
-
-        $flock = static::resolveFlockBinary();
-        if ($flock === null) {
-            # macOS has no util-linux flock; degrade to unlocked spawn rather than silently
-            # producing a command that does not exist.
-            static::log('use_spawn_lock is enabled but no flock binary was found; spawning without a lock.');
-            return $command;
-        }
-
-        $lockFile = (string) $config->get('spawn_lock_file');
-        if ($lockFile === '' || $lockFile[0] !== '/') {
-            # TEMP_PATH, not TEMP_FOLDER: Silverstripe 6 no longer defines TEMP_FOLDER, so this line
-            # fataled ("Undefined constant") on SS6 whenever flock was installed. On SS5 the two
-            # are the same value (framework 5 constants.php defines TEMP_FOLDER from TEMP_PATH).
-            // $lockFile = TEMP_FOLDER . '/' . ($lockFile ?: 'queuedjobs-enhancements-spawn.lock');
-            $lockFile = TEMP_PATH . '/' . ($lockFile ?: 'queuedjobs-enhancements-spawn.lock');
-        }
-
-        $timeout = (int) $config->get('spawn_lock_timeout');
-
-        # -w waits up to N seconds for the lock then gives up (the job stays queued, so cron
-        # still runs it). -n fails immediately. Waiting is usually right here: the process is
-        # already detached, so blocking costs nothing and no dispatch gets dropped.
-        $waitOpt = $timeout > 0 ? sprintf('-w %d', $timeout) : '-n';
-
-        return sprintf(
-            '%s %s %s %s',
-            escapeshellarg($flock),
-            $waitOpt,
-            escapeshellarg($lockFile),
-            $command
-        );
-    }
-
-    /**
-     * @deprecated unused since the drain spawn (queueAndRun() no longer spawns per job); to be
-     * removed in the next major. The drain's lock is taken by bin/qje-drain.sh.
-     *
-     * Locate the util-linux `flock` binary, or null when it is not installed.
-     */
-    protected static function resolveFlockBinary(): ?string
-    {
-        foreach (['/usr/bin/flock', '/bin/flock'] as $candidate) {
-            if (@is_executable($candidate)) {
-                return $candidate;
-            }
-        }
-
-        $found = @shell_exec('command -v flock 2>/dev/null');
-        $found = is_string($found) ? trim($found) : '';
-
-        return $found !== '' ? $found : null;
     }
 
     /**

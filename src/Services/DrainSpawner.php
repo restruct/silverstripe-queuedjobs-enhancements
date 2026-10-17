@@ -206,7 +206,8 @@ class DrainSpawner
     /**
      * The runner as an argument list: the module's worker, one-shot, on the immediate queue.
      * Silverstripe 5 runs it through cli-script.php (the task), Silverstripe 6 through the PHP sake
-     * script (the command); detected by file, as in ImmediateJobRunner.
+     * script (the command); detected by file rather than by version, so the check is the thing
+ * actually needed (as ImmediateJobRunner's per-job spawn did up to 1.6.0).
      *
      * @return string[]|null
      */

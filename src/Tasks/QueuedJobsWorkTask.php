@@ -19,10 +19,11 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  * Usage (run PHP directly, not through the `sake` shell wrapper, so a stop signal reaches the PHP
  * process):
  *   php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask queue=immediate
- *   ... max-time=3600 max-jobs=0 memory=512M job=123 linger=2
+ *   ... max-time=3600 max-jobs=0 memory=512M linger=2
  * It exits when the queue is empty; exit code 75 means it stopped early with work left
  * (QueueWorker::EXIT_MORE_WORK). `stop-when-empty=1`, which bin/qje-drain.sh passes, is accepted
- * and changes nothing since 1.7.0 (stopping when empty is the only behaviour).
+ * and changes nothing since 1.7.0 (stopping when empty is the only behaviour). The `job=<ID>`
+ * single-job mode of 1.6.0 was removed in 1.7.0; the option is no longer read.
  * A leading `--` on an option is accepted too (cli-script strips it), so `--queue=immediate` works.
  *
  * Silverstripe 6: `sake queuedjobs:work` (QueueWorkCommand); this task is disabled there.

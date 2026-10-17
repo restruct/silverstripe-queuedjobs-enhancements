@@ -3,16 +3,14 @@ Name: queuedjobs-enhancements
 After:
   - '#queuedjobsettings'
 ---
-# DEPRECATED, no effect since the drain spawn: ImmediateJobRunner::queueAndRun() always queues on
-# the IMMEDIATE queue now, and the drain spawn (below) runs it. A site with its own inotifywait
-# watcher sets DrainSpawner.enabled: false instead. Up to 1.6.0 the comment read:
+# Up to 1.6.0 this file set ImmediateJobRunner.use_immediate_queue: false ("set true if inotifywait
+# is running (uses IMMEDIATE queue instead of CLI spawn)"). Deprecated by the drain spawn and removed
+# in 1.7.0: ImmediateJobRunner::queueAndRun() always queues on the IMMEDIATE queue now, and the
+# drain spawn (below) runs it. A site with its own inotifywait watcher sets DrainSpawner.enabled:
+# false instead.
 #
-# ImmediateJobRunner: set true if inotifywait is running (uses IMMEDIATE queue instead of CLI spawn)
-#
-# NOTE: this also requires QueuedJobService.use_shutdown_function: false, otherwise no
+# NOTE: such a watcher also requires QueuedJobService.use_shutdown_function: false, otherwise no
 # trigger file is written and nothing can pick the job up sub-second. See the README.
-Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
-  use_immediate_queue: false
 
 # Drain spawn: every new IMMEDIATE job descriptor starts bin/qje-drain.sh in the background, which
 # runs the immediate queue until it is empty (one runner at a time, behind a lock). See the README,

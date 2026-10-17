@@ -25,7 +25,8 @@ use Throwable;
  * see $linger). It is the drain runner that bin/qje-drain.sh starts for the immediate queue (see
  * DrainSpawner). Since 1.7.0 this is its only mode: the resident (long-running, polling) worker
  * mode of 1.6.0, its --sleep option and its restart signal (queuedjobs:restart /
- * QueuedJobsRestartTask, WorkerRestartSignal) were removed.
+ * QueuedJobsRestartTask, WorkerRestartSignal) were removed, and so was the single-job --job mode
+ * that ImmediateJobRunner's per-job spawn used up to 1.6.0.
  *
  * Each pass takes ONE job via upstream's own QueuedJobService::getNextPendingJob() and runs it
  * through QueuedJobService::runJob(), which takes the per-descriptor mutex (grabMutex()), handles
@@ -91,8 +92,8 @@ class QueueWorker
         'max-jobs' => 0,
         # null = the QueuedJobService memory_limit (or PHP's memory_limit when that is unset)
         'memory' => null,
-        # run only this descriptor, then exit (used by ImmediateJobRunner's deprecated spawn helpers)
-        'job' => null,
+        // # run only this descriptor, then exit (used by ImmediateJobRunner's deprecated spawn helpers)
+        // 'job' => null,  // old: the --job mode of the per-job spawn, removed in 1.7.0
         // # exit as soon as every queue is empty (Laravel's --stop-when-empty)
         // 'stop-when-empty' => false,  // old: since 1.7.0 stopping when empty is the only behaviour;
         // the entry points still accept the flag, because bin/qje-drain.sh passes it
@@ -111,8 +112,6 @@ class QueueWorker
     /** @var int bytes; 0 = no limit */
     protected int $memoryLimit = 0;
 
-    protected ?int $jobId = null;
-
     /** @var float seconds; see $linger */
     protected float $lingerSeconds = 0;
 
@@ -128,7 +127,7 @@ class QueueWorker
     protected ?string $signalReason = null;
 
     /**
-     * @param array $options see DEFAULTS; unknown keys (such as the removed sleep and
+     * @param array $options see DEFAULTS; unknown keys (such as the removed sleep, job and
      *   stop-when-empty) are ignored
      * @param callable|null $write function (string $message): void
      */
@@ -142,7 +141,6 @@ class QueueWorker
         $this->memoryLimit = $options['memory'] !== null && $options['memory'] !== ''
             ? static::parseMemory((string) $options['memory'])
             : static::serviceMemoryLimit();
-        $this->jobId = $options['job'] !== null && $options['job'] !== '' ? static::parseJobId((string) $options['job']) : null;
         $linger = $options['linger'] !== null && $options['linger'] !== ''
             ? $options['linger']
             : static::config()->get('linger');
@@ -153,8 +151,8 @@ class QueueWorker
     }
 
     /**
-     * Run until the queues are empty (after the linger), a limit is reached, a stop signal arrives,
-     * or (with --job) the one job has run. Returns a process exit code (see the class doc).
+     * Run until the queues are empty (after the linger), a limit is reached or a stop signal
+     * arrives. Returns a process exit code (see the class doc).
      *
      * Entry points must not touch QueuedJobService before calling this (see disableShutdownDrain());
      * anything they need to do with the service, such as adding a log handler, goes in $onServiceReady.
@@ -172,10 +170,6 @@ class QueueWorker
         }
         $this->startedAt = DBDatetime::now()->getTimestamp();
         $this->registerSignalHandlers();
-
-        if ($this->jobId !== null) {
-            return $this->runSingleJob($service, $this->jobId);
-        }
 
         $this->output(sprintf(
             'Worker started (pid %d) on queue(s) %s',
@@ -260,43 +254,6 @@ class QueueWorker
         if ($this->jobsRun > 0) {
             return static::EXIT_MORE_WORK;
         }
-
-        return 0;
-    }
-
-    /**
-     * --job=N: run that one descriptor, if it may run now, then exit. Used by
-     * ImmediateJobRunner's background spawn, so it must never touch any other job. (That spawn,
-     * spawnJobProcess()/buildSpawnCommand(), is deprecated and no longer called by the module since
-     * the drain spawn; this mode is kept for as long as those helpers are.)
-     */
-    protected function runSingleJob(QueuedJobService $service, int $jobId): int
-    {
-        $descriptor = QueuedJobDescriptor::get()->byID($jobId);
-        if (!$descriptor) {
-            $this->output(sprintf('Job #%d does not exist.', $jobId));
-            return 1;
-        }
-
-        # Same rule as every runner: a paused queue starts nothing. The job stays queued.
-        if ($service->isMaintenanceLockActive()) {
-            $this->output(sprintf('Queue is paused (maintenance lock); job #%d left for later.', $jobId));
-            return 0;
-        }
-
-        # runJob() itself looks at neither the status nor StartAfter (only getNextPendingJob()
-        # does), so both are checked here: a finished, broken or paused job is not restarted, and a
-        # job with a future StartAfter is left for the queue runner to pick up when it is due.
-        if (!in_array($descriptor->JobStatus, [QueuedJob::STATUS_NEW, QueuedJob::STATUS_WAIT], true)) {
-            $this->output(sprintf('Job #%d has status %s; not running it.', $jobId, $descriptor->JobStatus));
-            return 0;
-        }
-        if ($descriptor->StartAfter && strtotime($descriptor->StartAfter) > DBDatetime::now()->getTimestamp()) {
-            $this->output(sprintf('Job #%d is not due until %s; left for the queue runner.', $jobId, $descriptor->StartAfter));
-            return 0;
-        }
-
-        $this->runOneJob($service, $jobId);
 
         return 0;
     }
@@ -434,9 +391,9 @@ class QueueWorker
      *
      * QueuedJobService's constructor registers onShutdown() on every CLI process while
      * use_shutdown_function is true (the default), and onShutdown() runs processJobQueue(IMMEDIATE):
-     * every pending immediate job, not only ours (SSKB queuedjobs §12). For `--job=N` that was
-     * "bug 3": a spawn meant for one job ran the whole immediate queue. A worker has no use for the
-     * drain either, since it processes its queues itself.
+     * every pending immediate job, not only ours (SSKB queuedjobs §12). For the `--job=N` mode of
+     * the per-job spawn (removed in 1.7.0) that was "bug 3": a spawn meant for one job ran the whole
+     * immediate queue. A worker has no use for the drain, since it processes its queues itself.
      *
      * The setting is read in the constructor, so it only works while the service has not been
      * instantiated yet in this process; the worker calls this first thing. A registered shutdown
@@ -525,19 +482,6 @@ class QueueWorker
         }
 
         return array_values(array_unique($parsed));
-    }
-
-    /**
-     * Accepts a bare descriptor ID, or anything ending in "-<ID>" (the "queuedjob-<ID>" trigger-file
-     * name ProcessJobQueueTask takes), so the same value works for both.
-     */
-    public static function parseJobId(string $job): int
-    {
-        if (!preg_match('#^(?:.*-)?(\d+)$#', trim($job), $matches) || (int) $matches[1] < 1) {
-            throw new InvalidArgumentException(sprintf('job must be the ID of a job descriptor, got "%s".', $job));
-        }
-
-        return (int) $matches[1];
     }
 
     /**

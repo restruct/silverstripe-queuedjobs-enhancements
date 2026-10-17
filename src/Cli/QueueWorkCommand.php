@@ -66,7 +66,7 @@ class QueueWorkCommand extends PolyCommand
                     'max-time' => $input->getOption('max-time'),
                     'max-jobs' => $input->getOption('max-jobs'),
                     'memory' => $input->getOption('memory'),
-                    'job' => $input->getOption('job'),
+                    // 'job' => $input->getOption('job'),  // old: --job mode of the per-job spawn, removed in 1.7.0
                     # stop-when-empty is not passed on: since 1.7.0 it is the only behaviour
                     // 'stop-when-empty' => $input->getOption('stop-when-empty'),  // old
                     'linger' => $input->getOption('linger'),
@@ -100,7 +100,7 @@ class QueueWorkCommand extends PolyCommand
             new InputOption('max-time', null, InputOption::VALUE_REQUIRED, 'Exit after this many seconds (0 = no limit)', $defaults['max-time']),
             new InputOption('max-jobs', null, InputOption::VALUE_REQUIRED, 'Exit after this many jobs (0 = no limit)', $defaults['max-jobs']),
             new InputOption('memory', null, InputOption::VALUE_REQUIRED, 'Exit when peak memory reaches this (e.g. 512M; a bare number is MB). Default: the QueuedJobService memory_limit'),
-            new InputOption('job', null, InputOption::VALUE_REQUIRED, 'Run only this job descriptor (ID, or queuedjob-ID), then exit'),
+            // new InputOption('job', null, InputOption::VALUE_REQUIRED, 'Run only this job descriptor (ID, or queuedjob-ID), then exit'),  // old: removed in 1.7.0
             // new InputOption('stop-when-empty', null, InputOption::VALUE_NONE, 'Exit as soon as the queue is empty'),
             # Still accepted, because bin/qje-drain.sh (and existing crons or scripts) pass it; without it
             # Symfony would reject the command line. It changes nothing.
