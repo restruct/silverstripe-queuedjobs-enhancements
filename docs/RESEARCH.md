@@ -1,18 +1,17 @@
 # Design Research & Rationale
 
-This document distills the design thinking behind `restruct/silverstripe-queuedjobs-enhancements` so the module's backup is self-contained. It records **why** each delivered component exists, the alternatives that were considered and rejected, and the SS5→SS6 migration notes. For the roadmap (done vs. planned) see [../PLAN.md](../PLAN.md); for usage see [../README.md](../README.md).
+This document distills the design thinking behind `restruct/silverstripe-queuedjobs-enhancements` so the module's backup is self-contained. It records **why** each delivered component exists, the alternatives that were considered and rejected, and the SS5→SS6 migration notes. For usage and the roadmap see [../README.md](../README.md).
 
 ## Sources
 
-The design was driven by these local documents. **This module does not depend on any of them** — everything needed is captured in this file, `README.md` and `PLAN.md`. Verified inventory (2026-07-02):
+The design was driven by these local documents. **This module does not depend on any of them** — everything needed is captured in this file and `README.md`. Verified inventory (2026-07-02):
 
 **Primary research (Restruct SSKB)**
 - `silverstripe/ideas/queuedjobs-enhancements.md` (~64 KB) — the research doc: problem statement, six proposed "pillars", prior-art survey, a Laravel-feature comparison, and full code sketches + the phased scope (Phases 1/2/5) the module was built from.
 - `silverstripe/topics/queuedjobs.md` (~63 KB) — the SSKB QueuedJobs reference (job lifecycle, config, patterns; the `ss-queuedjobs` agent knowledge base). Source for the shutdown-function / IMMEDIATE-queue analysis in this doc.
 
 **Plans**
-- `PLAN.md` (this repo) — the canonical, evolved plan actually followed (adds `_config/config.yml`, the CLI-spawn `ImmediateJobRunner`).
-- `~/.claude/plans/flickering-finding-sedgewick.md` — an earlier draft (used `fastcgi_finish_request()`, module at project root). Deleted from its original location, but **recovered verbatim from the session transcript** and preserved in this repo as [../PLAN-original-draft.md](../PLAN-original-draft.md) (with a provenance header). Fully superseded by `PLAN.md`.
+- The implementation plans were internal working documents and are not part of the published repository.
 
 **SSKB profiles that governed the workflow**
 - `silverstripe/profiles/local-module-dev.md` — the `_dev/` path-repository workflow (the fix for the double-scan bug below).

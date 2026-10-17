@@ -584,7 +584,7 @@ The full original evaluation is archived in the Restruct SSKB at `silverstripe/i
 
 ## Roadmap
 
-See [PLAN.md](PLAN.md) for what is implemented versus planned. Planned (not yet built):
+Planned (not yet built):
 
 - **Push notifications** — Web Push on job completion (e.g. via `minishlink/web-push`).
 - **`MultiStepJob` trait** — sequential/parallel/dynamic multi-step processing with a `StepResult` flow-control value object (`next()`, `repeat()`, `goto()`, `spawn()`, `complete()`).
