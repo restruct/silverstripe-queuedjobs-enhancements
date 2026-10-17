@@ -10,17 +10,14 @@ use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubWorkerHooks;
 use Restruct\QueuedJobsEnhancements\Worker\QueueWorker;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Dev\SapphireTest;
-use SilverStripe\ORM\FieldType\DBDatetime;
 use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
 use Symbiote\QueuedJobs\Services\QueuedJobService;
 
 /**
  * The worker loop, run in-process against the test database: queue priority, the exit conditions
- * (max-jobs, stop signal, a job parked for memory) and --job mode.
- *
- * What only a separate process can show (that a --job run does not drain the immediate queue at
- * exit) is covered by ImmediateSpawnRunsOnlyItsJobTest.
+ * (max-jobs, stop signal, a job parked for memory). The --job mode of 1.6.0 (and its child-process
+ * test, ImmediateSpawnRunsOnlyItsJobTest) was removed in 1.7.0 with the per-job spawn.
  */
 class QueueWorkerTest extends SapphireTest
 {
@@ -168,60 +165,8 @@ class QueueWorkerTest extends SapphireTest
         $this->assertSame(300 * 1048576, QueueWorker::serviceMemoryLimit());
     }
 
-    public function testJobModeRunsOnlyThatJob(): void
-    {
-        $mine = $this->queue(new StubNonDefaultJob());
-        $other = $this->queue(new StubImmediateJob('other'));
-
-        $exit = $this->worker(['job' => (string) $mine, 'stop-when-empty' => false])->run();
-
-        $this->assertSame(0, $exit);
-        $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($mine));
-        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($other));
-    }
-
-    public function testJobModeAcceptsTheTriggerFileName(): void
-    {
-        $mine = $this->queue(new StubNonDefaultJob());
-
-        $this->worker(['job' => 'queuedjob-' . $mine])->run();
-
-        $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($mine));
-    }
-
     /**
-     * runJob() ignores StartAfter; --job must not, or a spawn could run a job before its time.
-     */
-    public function testJobModeHonoursStartAfter(): void
-    {
-        DBDatetime::set_mock_now('2026-10-12 12:00:00');
-        $future = $this->queue(new StubImmediateJob('later'), '2026-10-12 13:00:00');
-
-        $this->worker(['job' => (string) $future])->run();
-
-        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($future));
-        $this->assertSame([], StubWorkerHooks::$ran);
-    }
-
-    public function testJobModeDoesNotRerunAFinishedJob(): void
-    {
-        $done = $this->queue(new StubImmediateJob('done'));
-        $descriptor = QueuedJobDescriptor::get()->byID($done);
-        $descriptor->JobStatus = QueuedJob::STATUS_COMPLETE;
-        $descriptor->write();
-
-        $this->worker(['job' => (string) $done])->run();
-
-        $this->assertSame([], StubWorkerHooks::$ran);
-    }
-
-    public function testJobModeReportsAMissingJob(): void
-    {
-        $this->assertSame(1, $this->worker(['job' => '999999'])->run());
-    }
-
-    /**
-     * A paused queue (maintenance lock) starts nothing, in either mode.
+     * A paused queue (maintenance lock) starts nothing. (Up to 1.6.0 this also covered --job mode.)
      */
     public function testMaintenanceLockStartsNothing(): void
     {
@@ -235,7 +180,6 @@ class QueueWorkerTest extends SapphireTest
         try {
             $this->assertTrue($service->isMaintenanceLockActive(), 'precondition: the lock is on');
             $this->worker([])->run();
-            $this->worker(['job' => (string) $job])->run();
         } finally {
             $service->disableMaintenanceLock();
         }
@@ -422,8 +366,6 @@ class QueueWorkerTest extends SapphireTest
             [QueuedJob::IMMEDIATE, QueuedJob::QUEUED, QueuedJob::LARGE],
             QueueWorker::parseQueues('immediate, queued,large,immediate')
         );
-        $this->assertSame(42, QueueWorker::parseJobId('42'));
-        $this->assertSame(42, QueueWorker::parseJobId('queuedjob-42'));
         # A bare number is megabytes, as in Laravel
         $this->assertSame(512 * 1048576, QueueWorker::parseMemory('512'));
         $this->assertSame(1073741824, QueueWorker::parseMemory('1G'));
@@ -434,12 +376,6 @@ class QueueWorkerTest extends SapphireTest
     {
         $this->expectException(InvalidArgumentException::class);
         QueueWorker::parseQueues('immediate,bogus');
-    }
-
-    public function testRejectsANonNumericJob(): void
-    {
-        $this->expectException(InvalidArgumentException::class);
-        QueueWorker::parseJobId('abc');
     }
 }
 
