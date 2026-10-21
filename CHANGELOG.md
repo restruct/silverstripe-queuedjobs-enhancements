@@ -71,7 +71,7 @@ stopping when empty is the only behaviour.
 
 ## 1.6.0 (2026-10-12)
 
-A Laravel-style queue worker (#5).
+A Laravel-style queue worker.
 
 ### Added
 
