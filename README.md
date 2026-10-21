@@ -14,12 +14,12 @@ Progress tracking, immediate execution, and consolidation utilities for [symbiot
 
 | Branch | Module version | Silverstripe | queuedjobs | PHP |
 |---|---|---|---|---|
-| `ss6` (unreleased) | next | 5.4+ and 6 | 5 and 6 | 8.1+ (SS5), 8.3+ (SS6) |
-| `main` | 1.x up to 1.4.0 | 5 only | 5 | 8.1+ |
+| `main` | 1.5.0 and later | 5.4+ and 6 | 5 and 6 | 8.1+ (SS5), 8.3+ (SS6) |
+| tags up to `1.4.0` | 1.0.0 to 1.4.0 | 5 only | 5 | 8.1+ |
 
 Where the two majors differ, the module detects which one is installed and does the right thing:
 the dev tasks have a separate entry point per major (see `src/Tasks/*EntryPoint.php`), and the
-CLI spawn runs `cli-script.php` on Silverstripe 5 and `bin/sake` on Silverstripe 6.
+drain spawn runs `cli-script.php` on Silverstripe 5 and `bin/sake` on Silverstripe 6.
 
 ## Installation
 
@@ -39,14 +39,18 @@ vendor/bin/sake db:build --flush
 The module registers:
 
 - A route `api/job-progress//$ID` → `JobProgressController` (via `_config/routes.yml`).
-- Two dev tasks: `check-default-jobs` and `cleanup-broken-jobs` (`dev/tasks/<name>` on Silverstripe 5, `sake tasks:<name>` on Silverstripe 6).
-- The queue worker and its restart signal: `sake queuedjobs:work` / `sake queuedjobs:restart` on
-  Silverstripe 6, `dev/tasks/QueuedJobsWorkTask` / `dev/tasks/QueuedJobsRestartTask` on Silverstripe 5
-  (see [§8](#8-queue-worker-queuedjobswork)). The restart signal lives in one small table,
-  `QueuedJobsWorkerRestartSignal`, so run a database build after upgrading.
+- Three dev tasks: `check-default-jobs`, `cleanup-broken-jobs` and `qjob-profile` (dev-only) (`dev/tasks/<name>` on Silverstripe 5, `sake tasks:<name>` on Silverstripe 6).
+- The drain runner: `sake queuedjobs:work` on Silverstripe 6, `dev/tasks/QueuedJobsWorkTask` on
+  Silverstripe 5 (see [§8](#8-drain-runner-queuedjobswork)). It adds no tables.
 - Exposes `client/` (for `client/js/job-progress.js`) via `extra.expose` in `composer.json`.
+- Two extensions on `QueuedJobDescriptor`: `QueuedJobDescriptorDrainExtension` (every new job on the
+  `IMMEDIATE` queue starts a background drain, see [§2](#2-immediate-job-execution); switch it off
+  with `DrainSpawner.enabled: false`) and `QueuedJobContextExtension` (records the running job in
+  `$_SERVER` for error reports, see [§9](#9-job-context-for-error-reports)).
 
-It registers no extensions and adds no runtime hooks — nothing runs unless you call it.
+<!-- It registers no extensions and adds no runtime hooks — nothing runs unless you call it. -->
+<!-- Apart from the drain spawn it adds no runtime hooks: nothing else runs unless you call it. -->
+Apart from these two descriptor hooks it adds no runtime hooks: nothing else runs unless you call it.
 
 ## Features
 
@@ -114,97 +118,124 @@ Vanilla JS, no framework dependency; works in both the CMS admin and frontend te
 
 ### 2. Immediate Job Execution
 
-Skip the cron wait — queue a job and trigger it to run immediately in a background CLI process.
+Skip the cron wait: every job queued on the `IMMEDIATE` queue starts within about a second, in a
+background CLI process. Nothing stays resident (no Supervisor program, no `inotifywait`, no
+polling), and it works for every way a job reaches that queue:
 
 ```php
 use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
+use Symbiote\QueuedJobs\Services\QueuedJob;
+use Symbiote\QueuedJobs\Services\QueuedJobService;
 
-$descriptorId = ImmediateJobRunner::queueAndRun($job);
-// optional second arg: $startAfter (a datetime string, e.g. 'Y-m-d H:i:s')
+QueuedJobService::singleton()->queueJob($job, null, null, QueuedJob::IMMEDIATE);
+// or a job whose getJobType() returns QueuedJob::IMMEDIATE, or (same thing, for existing callers):
+$descriptorId = ImmediateJobRunner::queueAndRun($job);   // optional 2nd arg: $startAfter
 ```
 
-A `$startAfter` in the future queues the job but does **not** spawn a process for it: the job is
-left to the queue runner, which starts it once that time has passed. (Up to 1.4.0 it was spawned
-anyway, and the spawned process ran it at once, ignoring the start time.)
-
-**How it works** — the job is *always* queued first (a safety net: if the spawn fails, cron still picks it up), then execution is triggered according to this detection order:
-
-| Priority | Condition | Behaviour |
-|----------|-----------|-----------|
-| 1 | `use_immediate_queue: true` | Queue as `QueuedJob::IMMEDIATE` (for setups where `inotifywait` monitors that queue) |
-| 2 | `exec()` available and not running under CLI | Spawn a detached background PHP process for this specific job |
-| 3 | Fallback | Job stays queued; the normal cron runner handles it (typically within 60 s) |
-
-The background process runs this module's worker (§8) for that one job:
+**How it works (the drain spawn).** `QueuedJobDescriptorDrainExtension` watches
+`QueuedJobDescriptor` writes. When a **new** descriptor on the `IMMEDIATE` queue has been written,
+`DrainSpawner` touches a marker file and starts the module's wrapper detached:
 
 ```bash
-# Silverstripe 5
-nohup <php> vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask job=<ID> max-jobs=1 > /dev/null 2>&1 &
-# Silverstripe 6 (cli-script.php no longer exists; sake is a PHP script there)
-nohup <php> vendor/silverstripe/framework/bin/sake queuedjobs:work --job=<ID> --max-jobs=1 > /dev/null 2>&1 &
+cd <project>; nohup bash vendor/restruct/silverstripe-queuedjobs-enhancements/bin/qje-drain.sh \
+    <marker> <lock> <php> <runner...> > /dev/null 2>&1 &
 ```
 
-In `--job` mode the worker runs that descriptor only if it is `New` or `Waiting` and due
-(`StartAfter` not in the future), and does nothing while the queue is paused (maintenance lock).
+The runner is the drain runner of §8 on the immediate queue:
 
-`<php>` is a real CLI binary: `PHP_BINARY` when the caller is itself CLI, otherwise the
-version-matched `phpX.Y` (or `php`) next to `PHP_BINDIR`, because under PHP-FPM `PHP_BINARY` is
-the FPM daemon, which cannot run a script. Spawn failures are logged as warnings and never break
-the request - the job remains safely queued. No `fastcgi_finish_request()` tricks and no core
-class replacement.
+```bash
+# Silverstripe 6
+<php> vendor/silverstripe/framework/bin/sake queuedjobs:work --queue=immediate --stop-when-empty
+# Silverstripe 5
+<php> vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask queue=immediate stop-when-empty=1
+```
 
-> **Up to 1.5.0 the spawned process also ran the whole IMMEDIATE queue as it exited.** The spawn
-> was `ProcessJobQueueTask job=queuedjob-<ID>`, and every CLI process that creates
-> `QueuedJobService` registers its shutdown handler (`use_shutdown_function`, default `true`), so
-> a spawn started for one job also ran every due `IMMEDIATE` job, on queuedjobs 5.x even while
-> the queue was paused. Since 1.6.0 the spawn runs the worker, which switches that handler off for
-> its own process; `use_shutdown_function` itself can stay at its default.
-> (`ImmediateSpawnRunsOnlyItsJobTest` runs the real spawn command against a child process to
-> prove this.) Other CLI processes still drain the immediate queue at exit, which is why upstream
-> plans to remove the option (symbiote/silverstripe-queuedjobs#506): run the immediate queue from
-> its own cron (`queue=immediate`) or a worker.
+`bin/qje-drain.sh` loops: take the lock without waiting (held by another drain: exit at once,
+before PHP starts); holding it, remove the marker and run the runner; after the runner exits, go
+again if the marker exists (a job was queued after the runner started) or the runner exited `75`
+(it stopped early with work left, see §8); otherwise exit. The descriptor row is written **before**
+the marker is touched, so a job queued after the runner's last look at the queue always leaves a
+marker behind for the wrapper to see. During a burst only the first dispatch starts PHP; the
+others cost a short-lived `bash` and lock attempt.
+
+The runner lingers before it exits: once the queue is empty it keeps looking for a new due job
+every 0.5 s for `QueueWorker.linger` seconds (default 2), so a trickle of dispatches is served by
+one process instead of a boot per job.
+
+What does **not** trigger a drain: updates of an existing descriptor, jobs on the `Queued` or
+`Large` queue, and a `queueJob()` that finds an existing job with the same signature (it writes no
+new row). A future `StartAfter` is not checked: the runner's `getNextPendingJob()` skips a job that
+is not due yet, so that drain exits after its linger and the cron picks the job up when it is due.
+
+**Requirements**
+
+| | |
+|---|---|
+| `exec()` | Not in `disable_functions`. Without it nothing is spawned (logged once per process) and the job waits in the `IMMEDIATE` queue for the cron or another runner, as with plain upstream. |
+| `bash` | `/bin/bash`, `/usr/bin/bash` or on `PATH`. |
+| A lock tool | util-linux `flock` with `-E` (every current Ubuntu/Debian, Forge servers), else `perl`'s `flock()` (macOS has perl but no `flock`). With neither, the wrapper runs unlocked and warns on stderr: upstream's per-job mutex still stops a job running twice, but a burst can start one PHP process per dispatch. |
+| A CLI php binary | Under PHP-FPM `PHP_BINARY` is the FPM daemon, which cannot run a script. The binary is, in this order: the `QJE_PHP_CLI` environment variable (read through `Environment::getEnv()`, so a `.env` entry works; FPM normally clears the real environment), the `DrainSpawner.php_cli` config, then automatic: `PHP_BINARY` under the CLI, else the version-exact `phpX.Y` (or `php`) next to `PHP_BINDIR`. A configured `php-fpm` value is ignored with a warning; php-fpm is never used. |
+| A cron | Keep `ProcessJobQueueTask` crons (also `queue=immediate`) as the safety net: health checks, default jobs, jobs whose spawn could not run, and `StartAfter` jobs. |
+
+**Configuration** (defaults shown):
+
+```yaml
+Restruct\QueuedJobsEnhancements\Services\DrainSpawner:
+  # false on a site that runs the immediate queue another way (an inotifywait watcher);
+  # jobs are queued as IMMEDIATE either way. Only an explicit false switches it off; a missing
+  # value (e.g. a config cache built before this setting existed) counts as on
+  enabled: true
+  # CLI php binary; QJE_PHP_CLI wins over this
+  php_cli: ''
+  # append the wrapper's and runners' output here, for debugging (relative = under TEMP_PATH)
+  log_file: ''
+Restruct\QueuedJobsEnhancements\Worker\QueueWorker:
+  # seconds a drain runner keeps looking for new jobs before it exits; 0 = exit at once
+  linger: 2
+```
+
+```bash
+# .env, when the automatic resolution does not find the right binary
+QJE_PHP_CLI="/usr/bin/php8.3"
+```
+
+The marker (`.qje-spawn/pending`) and the lock (`.qje-spawn/lock`) live in a subfolder of
+upstream's job folder (`QueuedJobService.cache_dir`, relative under `TEMP_PATH`;
+`ImmediateJobRunner::triggerFolder()`), so they follow the same configuration as the
+`queuedjob-<ID>` trigger files while a watcher on the job folder itself never sees them. `QueuedJobService.use_shutdown_function` is left at
+upstream's default; the drain does not depend on it, and the runner switches it off for its own
+process. Where it is false, upstream writes a `queuedjob-<ID>` trigger file per immediate job and
+only deletes it when the job completes; the runner deletes the file of every job it ran, whatever
+the outcome (§8), so broken or parked jobs leave none behind.
+
+**Transactions.** A job queued inside an open database transaction is invisible to the runner
+until the commit. The drain then runs twice: at once (which covers a commit within the linger) and
+once more at the end of the process (`register_shutdown_function`). So a request or task that
+commits and ends gets its job run; one that commits and then keeps running for a long time gets it
+at its exit, or from the cron.
+
+**Tests never spawn.** A process on a temporary test database (`SapphireTest`) never starts a
+drain: the runner would boot against the site's real database from `.env`.
+
+**Running `inotifywait` as well?** Set `DrainSpawner.enabled: false`, or the immediate queue is run
+twice over (harmless, through upstream's mutex, but double the processes). The marker sits in the
+`.qje-spawn/` subfolder so that upstream's (non-recursive) inotifywait recipe does not see it being
+touched: in the job folder itself it made the recipe run `ProcessJobQueueTask job=<marker name>`,
+which Silverstripe 6 rejects and Silverstripe 5 logs as an error.
+
+> **History.** Up to 1.6.0 `queueAndRun()` spawned one process per job (`queuedjobs:work --job=<ID>
+> --max-jobs=1`, before that `ProcessJobQueueTask job=queuedjob-<ID>`, which also drained the whole
+> immediate queue as it exited), skipped the spawn under the CLI and for a future `$startAfter`, and
+> with `use_immediate_queue: true` relied on an `inotifywait` watcher instead. The drain spawn
+> deprecated that per-job spawn, and 1.7.0 removed it: the spawn helpers, the runner's `--job`
+> option and the `use_immediate_queue`, `use_spawn_lock`, `spawn_lock_file` and
+> `spawn_lock_timeout` settings. Nothing reads `use_immediate_queue` any more; a YAML line that
+> sets it can be deleted.
 
 > **Calling `ProcessJobQueueTask` yourself? The `queuedjob-` prefix is mandatory there.** It only
 > enters single-job mode when the `job` parameter contains a dash (on Silverstripe 5, and on 6 up
 > to queuedjobs 6.2.0). A bare `job=42` silently falls through to draining the entire *Queued*
-> queue. The worker's `job` option takes either form.
-
-Because the spawn is a separate CLI process, it does **not** occupy a PHP-FPM worker (that is the failure mode of `fastcgi_finish_request()`, which this module deliberately avoids). The real cost is that each dispatch bootstraps Silverstripe in a new process — so spawns are serialised behind a `flock` lock by default (see below).
-
-**Concurrency (`flock`).** Without a lock, a burst of dispatches forks an unbounded number of PHP processes, each bootstrapping the whole framework. `use_spawn_lock` (on by default) wraps the spawn in `flock`, so at most one spawned runner executes at a time — the same property the `inotifywait` watcher gets for free, since `inotifywait … | sh` feeds commands into a single shell. Waiting is the default rather than failing fast: the process is already detached, so blocking costs nothing and no dispatch is dropped. If the wait times out the job simply stays queued and cron picks it up.
-
-`flock` comes from util-linux and is **absent on macOS**; when no binary is found the module logs a warning and spawns without a lock rather than emitting a command that cannot run.
-
-**Configuration:**
-
-```yaml
-Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
-  # Set true only if inotifywait (or similar) monitors the IMMEDIATE queue.
-  use_immediate_queue: false
-
-  # Serialise spawned runners so a burst cannot fork unbounded PHP processes.
-  use_spawn_lock: true
-  # Relative paths resolve under TEMP_PATH. Pin an absolute path if you want the
-  # lock shared across deployments (TEMP_PATH is derived from BASE_PATH, which
-  # changes per release on zero-downtime deploys).
-  spawn_lock_file: 'queuedjobs-enhancements-spawn.lock'
-  # Seconds to wait for the lock before giving up (job stays queued). 0 = fail fast (flock -n).
-  spawn_lock_timeout: 300
-```
-
-> **`use_immediate_queue: true` has a prerequisite.** The trigger file that `inotifywait` watches is
-> only written when the job's `JobType` is `IMMEDIATE` **and** `QueuedJobService.use_shutdown_function`
-> is `false` (see `QueuedJobDescriptor::activateOnQueue()`). That setting defaults to `true`, so you must
-> also set:
->
-> ```yaml
-> Symbiote\QueuedJobs\Services\QueuedJobService:
->   use_shutdown_function: false
-> ```
->
-> The module logs a warning if you enable `use_immediate_queue` without this. Note that disabling the
-> shutdown function also removes the behaviour where a CLI cron run drains the IMMEDIATE queue as it
-> exits — so keep a `queue=immediate` cron entry as a safety net if you rely on that.
+> queue. (The runner's own `job` option, which took either form, was removed in 1.7.0.)
 
 ### 3. Default-Job Diagnostics (`$is_default_job`)
 
@@ -382,106 +413,168 @@ trait carries the whole override; all tunables live on `ConcurrencyGuard`, a rea
 because config declared on a trait does not merge), or call `ConcurrencyGuard` yourself from
 your own `grabMutex()`.
 
-### 8. Queue Worker (`queuedjobs:work`)
+### 8. Drain Runner (`queuedjobs:work`)
 
-A long-running worker in the style of Laravel's `queue:work`: it polls the database and starts
-each job within about a second of it becoming due, instead of on the next cron tick. Run it under
-Supervisor (a Forge "daemon"), which restarts it whenever it exits.
+The one-shot runner that `bin/qje-drain.sh` starts (§2): it runs the due jobs of the given
+queue(s) in series, in the style of Laravel's `queue:work --stop-when-empty`, and exits when they
+are empty. You do not normally start it yourself; the drain spawn does.
 
 ```bash
 # Silverstripe 6
-php vendor/bin/sake queuedjobs:work --queue=immediate,queued
+php vendor/bin/sake queuedjobs:work --queue=immediate --stop-when-empty
 # Silverstripe 5: run cli-script.php with php directly, NOT the `sake` shell wrapper, which runs PHP
-# as a child process that Supervisor's stop signal never reaches
-php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask queue=immediate,queued
+# as a child process that a stop signal never reaches
+php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask queue=immediate stop-when-empty=1
 ```
 
 | Option (SS6 `--name=`, SS5 `name=`) | Default | Meaning |
 |---|---|---|
 | `queue` | `immediate` | Queue(s) to work, comma separated, highest priority first. Every pass takes the next job from the first queue that has one. |
-| `sleep` | `1` | Seconds to wait when every queue is empty. |
 | `max-time` | `3600` | Exit after this many seconds (`0` = no limit). |
 | `max-jobs` | `0` | Exit after this many jobs (`0` = no limit). |
 | `memory` | the `QueuedJobService.memory_limit` | Exit once peak memory reaches this (`512M`, `1G`; a bare number is MB, as in Laravel). |
-| `job` | | Run only this descriptor (`123` or `queuedjob-123`), then exit. This is what `ImmediateJobRunner` spawns. |
-| `stop-when-empty` | off | Exit as soon as the queues are empty. |
+| `linger` | `QueueWorker.linger` (2) | Once empty, keep looking for a due job every 0.5 s for this many seconds before exiting. `0` = exit at once. |
+| `stop-when-empty` | | No effect since 1.7.0: stopping when empty is the only behaviour. Still accepted, because `bin/qje-drain.sh` passes it. |
 
 **How it picks jobs.** Each pass calls upstream's own `QueuedJobService::getNextPendingJob()` and
 runs the job through `QueuedJobService::runJob()`: the same selection (`Waiting` jobs first, then
 due `New` jobs), the same per-descriptor mutex (`grabMutex()`), RunAs handling and memory/time
 parking as `ProcessJobQueueTask`. It is the body of `processJobQueue()`'s loop, one job at a time,
-so the worker can check its exit conditions between two jobs. A paused queue (maintenance lock)
-starts nothing.
+so the runner can check its exit conditions between two jobs. A paused queue (maintenance lock)
+starts nothing: the runner exits.
 
-**When it exits** (always with exit code 0, so Supervisor just starts a fresh one):
+**When it exits:**
 
-- `max-time`, `max-jobs` or `memory` is reached. Short-lived processes keep a long-running
-  Silverstripe process from accumulating leaked memory and stale state.
+- The queues are empty, after the linger.
+- `max-time`, `max-jobs` or `memory` is reached.
 - A job was left `Waiting`: `runJob()` parks a job when the process passes the service's memory or
-  time limit, and that job needs a fresh process to continue. The next worker resumes it first.
+  time limit, and that job needs a fresh process to continue. The next runner resumes it first.
 - `SIGTERM`, `SIGINT` or `SIGQUIT` arrives (needs `ext-pcntl`, standard on Linux CLI PHP). The
   current job **step** finishes, then the job is parked as `Waiting` with its lock released and the
-  worker exits; the next worker continues at the next step. This goes through upstream's own
+  runner exits; the next runner continues at the next step. This goes through upstream's own
   time-limit path, so the job log shows "Queue has passed time limit and will restart before
-  continuing". Supervisor's `stopwaitsecs` must be longer than your longest job step, or the
+  continuing". Whatever sends the signal must wait longer than your longest job step, or the
   process is killed mid-step and the job waits for the health check to restart it.
-- A restart was requested (below).
+
+**Exit codes:** `0` when the queue is empty (after the linger), the queue is paused, or it stopped
+before running any job; `75` (`QueueWorker::EXIT_MORE_WORK`) when it stopped early after running
+jobs, with work possibly left: `max-jobs`, `max-time`, `memory`, or a job parked as `Waiting`.
+`bin/qje-drain.sh` starts a new runner on `75`. A stop signal (SIGTERM/SIGINT/SIGQUIT) exits `0`:
+the runner was asked to go away, so the wrapper does not replace it; a job it left `Waiting` is run
+by the next dispatch or the cron. The stop-before-the-first-job case is `0` because it
+would stop the same way every time, and `75` would make the wrapper loop.
 
 **Between jobs** it resets what a job may change and `runJob()` does not restore: the subsite (as
 `processJobQueue()` does), the Versioned reading mode, the locale and the current user, and it
 clears the `DataObject` cache (on Silverstripe 5 `runJob()` reads the descriptor through the
-caching `DataObject::get_by_id()`, so a long-lived process would otherwise serve it stale).
+caching `DataObject::get_by_id()`, so a process that runs several jobs would otherwise serve it
+stale). It also deletes upstream's trigger file `<job folder>/queuedjob-<ID>` of the job it just
+ran, whatever the outcome (complete, broken or parked `Waiting`; a parked job is found again in
+the database, not through its file). Upstream only deletes it for a completed job. The files of
+jobs the runner did not run are left alone.
 
-**Restart on deploy.** A running worker keeps the code it started with. Add this to the deploy
-script, after the new release is live and the database is built:
+**Keep the crons.** The runner is an addition, not a replacement:
 
-```bash
-# Silverstripe 6
-php vendor/bin/sake queuedjobs:restart
-# Silverstripe 5
-php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsRestartTask
-```
-
-It stores a new token in the database (table `QueuedJobsWorkerRestartSignal`); every worker
-compares it with the token it saw at start-up and exits after its current job once it differs.
-The database rather than a cache or a file, because the deploy and the worker may run as different
-users, under different PHP versions, with different cache adapters.
-
-**Supervisor example** (adjust paths, PHP version and user; on Forge, enter the same values as a
-daemon, with the site's own user):
-
-```ini
-[program:example-queue-worker]
-command=php8.3 vendor/bin/sake queuedjobs:work --queue=immediate,queued --max-time=3600
-directory=/home/example/example.com/current
-user=example
-numprocs=1
-autostart=true
-autorestart=true
-; longer than the longest job STEP, so a stop lets the step finish
-stopwaitsecs=600
-stopasgroup=true
-killasgroup=true
-redirect_stderr=true
-stdout_logfile=/home/example/.queue-worker.log
-```
-
-With `max-jobs` set low the worker can exit within a second of starting; Supervisor counts an exit
-before `startsecs` (default 1) as a failed start and gives up after `startretries`, so keep
-`max-jobs` at 0 or high under Supervisor.
-
-**Keep the crons.** The worker is an addition, not a replacement:
-
-- `ProcessJobQueueTask` cron entries keep doing what the worker does not: the job health check
+- `ProcessJobQueueTask` cron entries keep doing what the runner does not: the job health check
   (which restarts jobs left `Running` by a killed process) and `defaultJobs` creation.
-- Keep the `queue=immediate` cron as a fallback for when no worker runs. A worker and a cron (or
-  several workers) never run the same descriptor twice: `grabMutex()` makes the claim atomic.
-- `use_shutdown_function` can stay at its default; the worker does not depend on it, and switches
+- Keep the `queue=immediate` cron as a fallback for when no drain could start. A runner and a cron
+  never run the same descriptor twice: `grabMutex()` makes the claim atomic.
+- `use_shutdown_function` can stay at its default; the runner does not depend on it, and switches
   it off for its own process.
 
-**Combining with `ImmediateJobRunner`.** `queueAndRun()` still spawns a process per job unless
-`use_immediate_queue` is on. With a worker on the job's queue that spawn is redundant but harmless
-(whichever claims the job first runs it).
+> **Removed in 1.7.0.** Up to 1.6.0 `queuedjobs:work` was also a resident, polling worker for
+> Supervisor (`--sleep`, no `--stop-when-empty`), with `queuedjobs:restart` /
+> `QueuedJobsRestartTask` for the deploy script and a `QueuedJobsWorkerRestartSignal` table. The
+> drain spawn replaces it. An existing `QueuedJobsWorkerRestartSignal` table is left alone by the
+> database build and can be dropped. A Supervisor program or deploy line that still calls the old
+> commands must be removed: `--sleep` and `queuedjobs:restart` no longer exist. The single-job
+> `--job=<ID>` mode, which `ImmediateJobRunner` spawned per job up to 1.6.0, was removed in 1.7.0
+> as well.
+
+### 9. Job context for error reports
+
+When a queued job dies of a PHP fatal (typically an OOM), the error report names only the runner
+(`GET dev/tasks/ProcessJobQueueTask`), not the job, and the job never gets to log anything itself.
+`QueuedJobContextExtension` (registered on `QueuedJobDescriptor`, always on) records the job being
+processed in `$_SERVER` after every write of its descriptor, which upstream's service does after
+every step:
+
+```
+QUEUED_JOB         #123 App\Jobs\SyncJob | Nightly sync | step 41/200 | queue 2
+QUEUED_JOB_MEMORY  used 312.4 MB / peak 340.1 MB | php.ini memory_limit 512M
+```
+
+Both keys are cleared as soon as the descriptor is no longer `Running`, so a later error in the
+same runner process is not blamed on a finished job. `$_SERVER` on purpose: it survives into the
+shutdown handler that renders the report, and reading it needs no allocation, which matters when
+the failure is memory exhaustion. The memory figures are from the last completed step, so a single
+step that jumps from well under the limit to a fatal shows exactly that.
+
+restruct/silverstripe-admintweaks' `EnhancedErrorFormatter` renders both keys (they are in its
+default `server_vars`); any other error reporter can read them from `$_SERVER`.
+
+### 10. Queued job profiler (`qjob-profile`)
+
+Runs a job's `setup()` + `process()` loop in-process and prints, per `process()` call, memory
+(+ delta), peak, the real `currentStep`, the serialised `jobData` size and the message count, then
+a summary. It answers "does this job accumulate, and where?". **Dev-only**: it really runs the job,
+so it writes whatever the job writes; outside `dev` it refuses.
+
+```bash
+# Silverstripe 6 (options; the same spelling works in the browser task runner)
+php -d memory_limit=512M vendor/bin/sake tasks:qjob-profile --class='App\Jobs\SyncJob' --maxcalls=50
+# Silverstripe 5 (CLI arguments are space-separated, not a query string)
+php -d memory_limit=512M vendor/silverstripe/framework/cli-script.php dev/tasks/qjob-profile class='App\Jobs\SyncJob' maxcalls=50
+```
+
+Without a class it lists the job classes it can profile; `maxcalls` defaults to 500. Run it with
+the memory limit the cron has, or the result means nothing. Reading it: a delta of about 0 across
+calls means the job does not leak (if it still dies, look at the data, e.g. one query fetching too
+many rows); `jobData` or `msgs` climbing is the accumulator, because both are re-serialised and
+written after every step (see [§11](#11-bounded-job-messages)).
+
+### 11. Bounded job messages
+
+Upstream's `copyJobToDescriptor()` serialises a job's whole message log and writes it to the
+descriptor after every step, so a job that logs inside a loop does work that grows with
+messages x steps: in one production case 21,106 messages (4.29 MB) were re-serialised 3,088 times
+until the runner ran out of memory at about 390 MB. The opt-in `BoundedJobMessages` trait keeps the
+log bounded: the first messages (the setup and context) and the last ones (what the job was doing
+when it stopped), with one marker in between that counts what was dropped.
+
+```php
+use Restruct\QueuedJobsEnhancements\Jobs\BoundedJobMessages;
+
+class SyncJob extends AbstractQueuedJob
+{
+    use BoundedJobMessages;
+}
+```
+
+Settings are read from the **job class** (a `private static` on it, or YAML keyed to it; a subclass
+inherits them). YAML keyed to the trait name has no effect. Defaults shown:
+
+```yaml
+App\Jobs\SyncJob:
+  # 1. bounding, on once the trait is used
+  bound_messages: true
+  keep_first_messages: 10
+  keep_last_messages: 200
+  # %d = the number of messages dropped so far (a text without %d is used as it is)
+  omitted_messages_marker: '... %d earlier message(s) omitted to keep the job log bounded ...'
+  # 2. severity filter, off: e.g. WARNING drops NOTICE, INFO and DEBUG (an unknown severity counts as INFO)
+  min_message_severity: ''
+  # 3. append " [current/peakMB]" to every kept message, off
+  message_memory_usage: false
+```
+
+- The omitted count is kept in the job data, so it survives between steps (and processes), and the
+  previous marker is recognised on the next trim, so the counts add up.
+- Filtered messages are discarded, not counted as omitted. The filter also applies to the messages
+  upstream's service adds to the job.
+- A job that declares its own `addMessage()` overrides the trait's: call
+  `$this->addBoundedMessage($message, $severity)` from it instead of `parent::addMessage()`.
+- The descriptor log becomes a summary. Send what must be kept in full to a PSR logger as well.
 
 ## Dev Tasks
 
@@ -489,19 +582,22 @@ before `startsecs` (default 1) as a failed start and gives up after `startretrie
 |------|---------|-------------|
 | Check Default Jobs | `check-default-jobs` / `tasks:check-default-jobs` | Report declared default jobs and whether they're queued (`yaml=1`, or `--yaml` on SS6, emits the core `defaultJobs` config). Creates nothing. |
 | Cleanup Broken Jobs | `cleanup-broken-jobs` / `tasks:cleanup-broken-jobs` | Delete all broken jobs |
-| Queue worker | `QueuedJobsWorkTask` / `queuedjobs:work` | Long-running worker (§8). CLI only. |
-| Restart workers | `QueuedJobsRestartTask` / `queuedjobs:restart` | Make running workers exit after their current job (deploy). |
+| Drain runner | `QueuedJobsWorkTask` / `queuedjobs:work` | One-shot runner started by the drain spawn (§8). CLI only. |
+| Profile a queued job | `qjob-profile` / `tasks:qjob-profile` | Run a job in-process and report memory, step, `jobData` size and message count per `process()` call (§10). Dev-only. |
 
 ## Module Structure
 
 ```
 src/
 ├── Cli/                                # Silverstripe 6 sake commands
-│   ├── QueueRestartCommand.php         # queuedjobs:restart
 │   └── QueueWorkCommand.php            # queuedjobs:work
 ├── Controllers/
 │   └── JobProgressController.php       # REST API for job progress
+├── Extensions/
+│   ├── QueuedJobContextExtension.php   # running job -> $_SERVER QUEUED_JOB(_MEMORY)
+│   └── QueuedJobDescriptorDrainExtension.php  # new IMMEDIATE descriptor -> drain spawn
 ├── Jobs/
+│   ├── BoundedJobMessages.php          # Opt-in trait: bounded message log
 │   ├── ScheduledMethodCall.php         # Queue method calls
 │   └── SendEmailJob.php                # Send a composed Email asynchronously
 ├── Services/
@@ -509,21 +605,25 @@ src/
 │   ├── ConcurrencyGuardedMutex.php     # grabMutex() claim-then-verify override (trait)
 │   ├── DefaultJobManager.php           # Default-job discovery + diagnostics + YAML emitter
 │   ├── EnhancedQueuedJobService.php    # The single opt-in Injector swap target
-│   └── ImmediateJobRunner.php          # CLI spawn (flock-serialised) for immediate execution
+│   ├── DrainSpawner.php                # Drain spawn: marker + detached bin/qje-drain.sh
+│   └── ImmediateJobRunner.php          # queueAndRun(), CLI php binary, job folder
 ├── Tasks/
 │   ├── CheckDefaultJobsTask.php        # Report default jobs / emit defaultJobs YAML
 │   ├── CheckDefaultJobsTaskEntryPoint.php   # run() on SS5 / execute() on SS6
 │   ├── CleanupBrokenJobsTask.php       # Delete broken jobs
 │   ├── CleanupBrokenJobsTaskEntryPoint.php  # run() on SS5 / execute() on SS6
-│   ├── QueuedJobsRestartTask.php       # SS5 entry point of queuedjobs:restart
+│   ├── QueuedJobProfileTask.php        # Profile a job in-process (dev-only)
+│   ├── QueuedJobProfileTaskEntryPoint.php   # run() on SS5 / execute() on SS6
 │   ├── QueuedJobsWorkTask.php          # SS5 entry point of queuedjobs:work
 │   └── WorkerTaskEntryPoint.php        # run() on SS5 / disabled stub on SS6
 └── Worker/
-    ├── QueueWorker.php                 # The worker loop (version-neutral)
-    └── WorkerRestartSignal.php         # DataObject holding the restart token
+    └── QueueWorker.php                 # The one-shot drain runner (version-neutral)
 
 client/js/
 └── job-progress.js                     # Vanilla JS polling component
+
+bin/
+└── qje-drain.sh                        # Drain wrapper: lock, marker, one-shot runner loop
 ```
 
 ## Testing
@@ -536,16 +636,19 @@ be present, so not a dist install):
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
 # Silverstripe 6 (PHPUnit 11): the flush is an environment variable
 SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
-# expected on both: OK (79 tests); 201 assertions on SS5, 202 on SS6 (one test asserts the
-# version-specific spawn command)
+# expected: OK (107 tests, 319 assertions) on SS5, OK (107 tests, 324 assertions) on SS6
+# (the profiler task's exit codes exist, and are asserted, on SS6 only)
+
+# The drain wrapper, no PHP or database needed (every lock tool available here); --mutants checks
+# that four broken copies of the wrapper each fail it
+bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-test.sh
+bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-test.sh --mutants
 ```
 
 CI (`.github/workflows/ci.yml`) runs the suite on Silverstripe 5 (PHP 8.1 and 8.3) and
 Silverstripe 6 (PHP 8.3), then boots each host, builds the database and runs both dev tasks.
 
-The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, the spawn command contract, `flock` wrapping, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, the queue worker (priority order, every exit condition, `--job` mode; `QueueWorkerTest`), the spawn running only its own job in a real child process (`ImmediateSpawnRunsOnlyItsJobTest`, with a control showing that the 1.5.0 command drains the immediate queue), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
-
-The `flock` tests stub the binary lookup, so the lock-wrapping and no-flock branches are both exercised on macOS *and* Linux rather than being skipped on whichever platform lacks `flock`.
+The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 
 > **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` — the tests follow this convention deliberately.
 
@@ -554,18 +657,25 @@ The `flock` tests stub the binary lookup, so the lock-wrapping and no-flock bran
 ## Design Principles
 
 1. **Never replace or subclass core QueuedJobs classes — unless there is no hook, and then only opt-in.** Extensions where hooks exist, complementary services alongside. The one exception is `EnhancedQueuedJobService` (concurrency guard): `QueuedJobService` exposes no extension point at job selection or `grabMutex()`, so a subclass is the only non-fork option — it overrides that single method, is inert unless a job opts in, and the Injector swap is never registered by the module itself (each project enables it explicitly).
-2. **Play well with existing infrastructure.** If `inotifywait` is set up, use the IMMEDIATE queue (note: `inotifywait` is not installed by default — it comes from the `inotify-tools` package). If `defaultJobs` YAML exists, it keeps working. Respect the existing job runner.
+2. **Play well with existing infrastructure.** If `inotifywait` is set up, switch the drain spawn off (`DrainSpawner.enabled: false`) and let it run the IMMEDIATE queue (note: `inotifywait` is not installed by default — it comes from the `inotify-tools` package). If `defaultJobs` YAML exists, it keeps working. Respect the existing job runner.
 3. **CLI spawn over FPM tricks.** Background processes via `exec()` are more robust and portable than `fastcgi_finish_request()`, and — unlike it — do not hold a PHP-FPM worker for the duration of the job.
 4. **Traits over base classes.** (Future: a `MultiStepJob` trait for sequential/parallel/dynamic step processing with flow control.)
 
 ## Migration from admintweaks
 
-`ScheduledMethodCall` and `CleanupBrokenJobsTask` were consolidated from `restruct/silverstripe-admintweaks`. If you used them from there, update the namespace — the API is identical, only the `use` statement changes:
+`ScheduledMethodCall` and `CleanupBrokenJobsTask` were consolidated from `restruct/silverstripe-admintweaks`; `QueuedJobContextExtension` and `QueuedJobProfileTask` followed in 1.7.0. If you used them from there, update the namespace — the API is identical, only the `use` statement changes:
 
 | Old (admintweaks) | New (this module) |
 |---|---|
 | `Restruct\Silverstripe\AdminTweaks\Jobs\ScheduledMethodCall` | `Restruct\QueuedJobsEnhancements\Jobs\ScheduledMethodCall` |
 | `Restruct\Silverstripe\AdminTweaks\Dev\CleanupBrokenJobsTask` | `Restruct\QueuedJobsEnhancements\Tasks\CleanupBrokenJobsTask` |
+| `Restruct\Silverstripe\AdminTweaks\Extensions\QueuedJobContextExtension` | `Restruct\QueuedJobsEnhancements\Extensions\QueuedJobContextExtension` |
+| `Restruct\Silverstripe\AdminTweaks\Dev\QueuedJobProfileTask` | `Restruct\QueuedJobsEnhancements\Tasks\QueuedJobProfileTask` |
+
+The extension and the profiler need no change in a project: admintweaks (from the releases that
+mark them deprecated) stops registering its extension and disables its task when this module's
+classes exist, so each runs once, under the same task name (`qjob-profile`). With an older
+admintweaks both extensions run; they write the same keys with the same values, which is harmless.
 
 ## Background & research
 
@@ -575,7 +685,7 @@ The full original evaluation is archived in the Restruct SSKB at `silverstripe/i
 
 ## Roadmap
 
-See [PLAN.md](PLAN.md) for what is implemented versus planned. Planned (not yet built):
+Planned (not yet built):
 
 - **Push notifications** — Web Push on job completion (e.g. via `minishlink/web-push`).
 - **`MultiStepJob` trait** — sequential/parallel/dynamic multi-step processing with a `StepResult` flow-control value object (`next()`, `repeat()`, `goto()`, `spawn()`, `complete()`).

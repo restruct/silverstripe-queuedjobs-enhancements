@@ -8,20 +8,16 @@ use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubMultiStepJob;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubNonDefaultJob;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubWorkerHooks;
 use Restruct\QueuedJobsEnhancements\Worker\QueueWorker;
-use Restruct\QueuedJobsEnhancements\Worker\WorkerRestartSignal;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Dev\SapphireTest;
-use SilverStripe\ORM\FieldType\DBDatetime;
 use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
 use Symbiote\QueuedJobs\Services\QueuedJobService;
 
 /**
  * The worker loop, run in-process against the test database: queue priority, the exit conditions
- * (max-jobs, restart signal, stop signal, a job parked for memory) and --job mode.
- *
- * What only a separate process can show (that a --job run does not drain the immediate queue at
- * exit) is covered by ImmediateSpawnRunsOnlyItsJobTest.
+ * (max-jobs, stop signal, a job parked for memory). The --job mode of 1.6.0 (and its child-process
+ * test, ImmediateSpawnRunsOnlyItsJobTest) was removed in 1.7.0 with the per-job spawn.
  */
 class QueueWorkerTest extends SapphireTest
 {
@@ -47,9 +43,12 @@ class QueueWorkerTest extends SapphireTest
 
     protected function worker(array $options): TestQueueWorker
     {
-        # sleep 0 and stop-when-empty: a test never waits, and never loops forever
+        # sleep 0 and stop-when-empty: a test never waits, and never loops forever.
+        # linger 0: without it every one-shot run here would wait out the 2 s default linger
+        // return TestQueueWorker::create(
+        //     array_merge(['sleep' => 0, 'stop-when-empty' => true], $options),
         return TestQueueWorker::create(
-            array_merge(['sleep' => 0, 'stop-when-empty' => true], $options),
+            array_merge(['sleep' => 0, 'stop-when-empty' => true, 'linger' => 0], $options),
             function (string $message): void {
                 $this->output[] = $message;
             }
@@ -103,36 +102,6 @@ class QueueWorkerTest extends SapphireTest
         $this->assertSame(['a', 'b'], StubWorkerHooks::$ran);
         $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($ids[2]));
         $this->assertStringContainsString('max-jobs (2) reached', implode("\n", $this->output));
-    }
-
-    public function testRestartSignalStopsTheWorkerAfterTheCurrentJob(): void
-    {
-        $first = $this->queue(new StubMultiStepJob('first'));
-        $second = $this->queue(new StubImmediateJob('second'));
-
-        # queuedjobs:restart arrives while the first job is running
-        StubWorkerHooks::$onStep = function (string $label, int $step): void {
-            if ($label === 'first' && $step === 1) {
-                WorkerRestartSignal::requestRestart();
-            }
-        };
-
-        $this->worker([])->run();
-
-        # The running job is finished, not cut short; the next one is left for the new worker
-        $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($first));
-        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($second));
-        $this->assertStringContainsString('restart requested', implode("\n", $this->output));
-    }
-
-    public function testRestartTokenKeepsOneRow(): void
-    {
-        $first = WorkerRestartSignal::requestRestart();
-        $second = WorkerRestartSignal::requestRestart();
-
-        $this->assertNotSame($first, $second);
-        $this->assertSame($second, WorkerRestartSignal::currentToken());
-        $this->assertSame(1, WorkerRestartSignal::get()->count());
     }
 
     /**
@@ -196,60 +165,8 @@ class QueueWorkerTest extends SapphireTest
         $this->assertSame(300 * 1048576, QueueWorker::serviceMemoryLimit());
     }
 
-    public function testJobModeRunsOnlyThatJob(): void
-    {
-        $mine = $this->queue(new StubNonDefaultJob());
-        $other = $this->queue(new StubImmediateJob('other'));
-
-        $exit = $this->worker(['job' => (string) $mine, 'stop-when-empty' => false])->run();
-
-        $this->assertSame(0, $exit);
-        $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($mine));
-        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($other));
-    }
-
-    public function testJobModeAcceptsTheTriggerFileName(): void
-    {
-        $mine = $this->queue(new StubNonDefaultJob());
-
-        $this->worker(['job' => 'queuedjob-' . $mine])->run();
-
-        $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($mine));
-    }
-
     /**
-     * runJob() ignores StartAfter; --job must not, or a spawn could run a job before its time.
-     */
-    public function testJobModeHonoursStartAfter(): void
-    {
-        DBDatetime::set_mock_now('2026-10-12 12:00:00');
-        $future = $this->queue(new StubImmediateJob('later'), '2026-10-12 13:00:00');
-
-        $this->worker(['job' => (string) $future])->run();
-
-        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($future));
-        $this->assertSame([], StubWorkerHooks::$ran);
-    }
-
-    public function testJobModeDoesNotRerunAFinishedJob(): void
-    {
-        $done = $this->queue(new StubImmediateJob('done'));
-        $descriptor = QueuedJobDescriptor::get()->byID($done);
-        $descriptor->JobStatus = QueuedJob::STATUS_COMPLETE;
-        $descriptor->write();
-
-        $this->worker(['job' => (string) $done])->run();
-
-        $this->assertSame([], StubWorkerHooks::$ran);
-    }
-
-    public function testJobModeReportsAMissingJob(): void
-    {
-        $this->assertSame(1, $this->worker(['job' => '999999'])->run());
-    }
-
-    /**
-     * A paused queue (maintenance lock) starts nothing, in either mode.
+     * A paused queue (maintenance lock) starts nothing. (Up to 1.6.0 this also covered --job mode.)
      */
     public function testMaintenanceLockStartsNothing(): void
     {
@@ -263,7 +180,6 @@ class QueueWorkerTest extends SapphireTest
         try {
             $this->assertTrue($service->isMaintenanceLockActive(), 'precondition: the lock is on');
             $this->worker([])->run();
-            $this->worker(['job' => (string) $job])->run();
         } finally {
             $service->disableMaintenanceLock();
         }
@@ -281,14 +197,175 @@ class QueueWorkerTest extends SapphireTest
         $this->assertFalse(Config::inst()->get(QueuedJobService::class, 'use_shutdown_function'));
     }
 
+    /**
+     * The runner deletes upstream's trigger file `queuedjob-<ID>` of every job it ran, whatever the
+     * outcome (here: one complete, one broken). Upstream itself only deletes it for a completed job.
+     * The files of jobs it did not run stay.
+     */
+    public function testDeletesTheTriggerFilesOfTheJobsItRan(): void
+    {
+        # A job folder of this test's own, so no real trigger files are touched
+        $folder = TEMP_PATH . '/qje-trigger-test-' . getmypid();
+        Config::modify()->set(QueuedJobService::class, 'cache_dir', $folder);
+        # Upstream writes the trigger file only while the shutdown drain is off (activateOnQueue())
+        Config::modify()->set(QueuedJobService::class, 'use_shutdown_function', false);
+        StubWorkerHooks::$onStep = function (string $label, int $step): void {
+            if ($label === 'broken') {
+                throw new \RuntimeException('stub job breaks on purpose');
+            }
+        };
+
+        try {
+            $done = $this->queue(new StubImmediateJob('done'));
+            $broken = $this->queue(new StubMultiStepJob('broken'));
+            # Queued last, so max-jobs 2 leaves it alone
+            $notRun = $this->queue(new StubImmediateJob('not-run'));
+            # A file of a job that does not exist at all: not this runner's either
+            touch($folder . '/queuedjob-999999');
+            foreach ([$done, $broken, $notRun] as $id) {
+                $this->assertFileExists($folder . '/queuedjob-' . $id, 'precondition: upstream wrote the trigger file');
+            }
+
+            $this->worker(['max-jobs' => 2])->run();
+
+            $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($done));
+            $this->assertSame(QueuedJob::STATUS_BROKEN, $this->jobStatus($broken));
+            $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($notRun));
+            $this->assertFileDoesNotExist($folder . '/queuedjob-' . $done);
+            $this->assertFileDoesNotExist($folder . '/queuedjob-' . $broken, 'a broken job\'s file must go too');
+            $this->assertFileExists($folder . '/queuedjob-' . $notRun, 'a job the runner did not run keeps its file');
+            $this->assertFileExists($folder . '/queuedjob-999999');
+        } finally {
+            foreach (glob($folder . '/*') ?: [] as $file) {
+                @unlink($file);
+            }
+            @rmdir($folder);
+        }
+    }
+
+    /**
+     * One-shot mode (the drain runner of bin/qje-drain.sh): a stop at a limit after running jobs
+     * exits EXIT_MORE_WORK, so the wrapper starts another runner for the rest. In 1.6.0 this was 0,
+     * and the jobs left behind waited for the next dispatch or the cron.
+     */
+    public function testOneShotMaxJobsExitsMoreWork(): void
+    {
+        foreach (['a', 'b', 'c'] as $label) {
+            $this->queue(new StubImmediateJob($label));
+        }
+
+        $this->assertSame(QueueWorker::EXIT_MORE_WORK, $this->worker(['max-jobs' => 2])->run());
+        # Control: the rest, with no limit, empties the queue and exits 0
+        $this->assertSame(0, $this->worker([])->run());
+        $this->assertSame(['a', 'b', 'c'], StubWorkerHooks::$ran);
+    }
+
+    /**
+     * A job parked as Waiting (memory) needs a fresh process to continue: one-shot mode says so.
+     */
+    public function testOneShotParkedJobExitsMoreWork(): void
+    {
+        $job = $this->queue(new StubMultiStepJob('heavy'));
+        Config::modify()->set(QueuedJobService::class, 'memory_limit', '1K');
+
+        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($job), 'precondition');
+        $this->assertSame(QueueWorker::EXIT_MORE_WORK, $this->worker(['memory' => '64G'])->run());
+        $this->assertSame(QueuedJob::STATUS_WAIT, $this->jobStatus($job));
+    }
+
+    /**
+     * A stop signal after a job step parks that job. One-shot mode exits 0 all the same: the runner
+     * was asked to go away, so the drain wrapper must not start a replacement (mic's decision,
+     * 2026-10-15; it was EXIT_MORE_WORK before). The parked job waits for the next dispatch.
+     */
+    // public function testOneShotStopSignalExitsMoreWork(): void  // old name: a stop signal returned EXIT_MORE_WORK
+    public function testOneShotStopSignalExitsZero(): void
+    {
+        $job = $this->queue(new StubMultiStepJob('long'));
+        $worker = $this->worker([]);
+        StubWorkerHooks::$onStep = function (string $label, int $step) use ($worker): void {
+            if ($step === 1) {
+                $worker->handleSignal(defined('SIGTERM') ? SIGTERM : 15);
+            }
+        };
+
+        // $this->assertSame(QueueWorker::EXIT_MORE_WORK, $worker->run());  // old: a stop signal meant "start another runner"
+        $this->assertSame(0, $worker->run());
+        $this->assertSame(QueuedJob::STATUS_WAIT, $this->jobStatus($job));
+    }
+
+    /**
+     * A runner that stops before its first job would stop the same way every time; EXIT_MORE_WORK
+     * would make the drain wrapper start runners in a tight loop. So it exits 0.
+     */
+    public function testOneShotStopBeforeAnyJobExitsZero(): void
+    {
+        $job = $this->queue(new StubImmediateJob('never'));
+
+        $this->assertSame(0, $this->worker(['memory' => '1K'])->run());
+        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($job));
+    }
+
+    public function testLingerDefaultsToTheConfig(): void
+    {
+        $this->assertEquals(2, Config::inst()->get(QueueWorker::class, 'linger'), 'shipped default');
+
+        Config::modify()->set(QueueWorker::class, 'linger', 7);
+        $property = new \ReflectionProperty(QueueWorker::class, 'lingerSeconds');
+        $property->setAccessible(true);
+        $this->assertSame(7.0, $property->getValue(QueueWorker::create(['stop-when-empty' => true])));
+        # The option wins over the config
+        $this->assertSame(0.5, $property->getValue(QueueWorker::create(['stop-when-empty' => true, 'linger' => '0.5'])));
+    }
+
+    /**
+     * With linger, an empty queue is watched for that long before exiting; with 0 it exits at once.
+     */
+    public function testLingerWaitsBeforeExiting(): void
+    {
+        $start = microtime(true);
+        $this->assertSame(0, $this->worker(['linger' => 1])->run());
+        $lingered = microtime(true) - $start;
+
+        $start = microtime(true);
+        $this->assertSame(0, $this->worker(['linger' => 0])->run());
+        $immediate = microtime(true) - $start;
+
+        $this->assertGreaterThanOrEqual(0.95, $lingered, 'linger 1 must keep looking for about a second');
+        $this->assertLessThan(3.0, $lingered, 'and then exit');
+        $this->assertLessThan(0.5, $immediate, 'linger 0 must exit at once');
+    }
+
+    /**
+     * A job that shows up while the runner lingers is run by that runner. LateJobQueueWorker hides
+     * the queue from the first two looks, as if the job was committed just after the empty check.
+     */
+    public function testLingerRunsAJobThatArrivesLate(): void
+    {
+        $job = $this->queue(new StubImmediateJob('late'));
+
+        $worker = LateJobQueueWorker::create(['stop-when-empty' => true, 'linger' => 2], function (string $message): void {
+            $this->output[] = $message;
+        });
+        $this->assertSame(0, $worker->run());
+        $this->assertSame(QueuedJob::STATUS_COMPLETE, $this->jobStatus($job));
+        $this->assertSame(['late'], StubWorkerHooks::$ran);
+
+        # Control: without linger the same runner exits on the first empty look and the job stays New
+        $other = $this->queue(new StubImmediateJob('missed'));
+        $worker = LateJobQueueWorker::create(['stop-when-empty' => true, 'linger' => 0], function (string $message): void {
+            $this->output[] = $message;
+        });
+        $this->assertSame(0, $worker->run());
+        $this->assertSame(QueuedJob::STATUS_NEW, $this->jobStatus($other));
+    }
+
     public function testParsesOptions(): void
     {
         $this->assertSame(
             [QueuedJob::IMMEDIATE, QueuedJob::QUEUED, QueuedJob::LARGE],
             QueueWorker::parseQueues('immediate, queued,large,immediate')
         );
-        $this->assertSame(42, QueueWorker::parseJobId('42'));
-        $this->assertSame(42, QueueWorker::parseJobId('queuedjob-42'));
         # A bare number is megabytes, as in Laravel
         $this->assertSame(512 * 1048576, QueueWorker::parseMemory('512'));
         $this->assertSame(1073741824, QueueWorker::parseMemory('1G'));
@@ -300,12 +377,6 @@ class QueueWorkerTest extends SapphireTest
         $this->expectException(InvalidArgumentException::class);
         QueueWorker::parseQueues('immediate,bogus');
     }
-
-    public function testRejectsANonNumericJob(): void
-    {
-        $this->expectException(InvalidArgumentException::class);
-        QueueWorker::parseJobId('abc');
-    }
 }
 
 /**
@@ -316,5 +387,23 @@ class TestQueueWorker extends QueueWorker
 {
     protected function registerSignalHandlers(): void
     {
+    }
+}
+
+/**
+ * Sees an empty queue on its first two looks, then the real one: a job that is committed just after
+ * the runner's empty check (see testLingerRunsAJobThatArrivesLate).
+ */
+class LateJobQueueWorker extends TestQueueWorker
+{
+    protected int $looks = 0;
+
+    protected function nextJob(QueuedJobService $service): ?QueuedJobDescriptor
+    {
+        if (++$this->looks <= 2) {
+            return null;
+        }
+
+        return parent::nextJob($service);
     }
 }

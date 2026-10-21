@@ -3,12 +3,40 @@ Name: queuedjobs-enhancements
 After:
   - '#queuedjobsettings'
 ---
-# ImmediateJobRunner: set true if inotifywait is running (uses IMMEDIATE queue instead of CLI spawn)
+# Up to 1.6.0 this file set ImmediateJobRunner.use_immediate_queue: false ("set true if inotifywait
+# is running (uses IMMEDIATE queue instead of CLI spawn)"). Deprecated by the drain spawn and removed
+# in 1.7.0: ImmediateJobRunner::queueAndRun() always queues on the IMMEDIATE queue now, and the
+# drain spawn (below) runs it. A site with its own inotifywait watcher sets DrainSpawner.enabled:
+# false instead.
 #
-# NOTE: this also requires QueuedJobService.use_shutdown_function: false, otherwise no
+# NOTE: such a watcher also requires QueuedJobService.use_shutdown_function: false, otherwise no
 # trigger file is written and nothing can pick the job up sub-second. See the README.
-Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner:
-  use_immediate_queue: false
+
+# Drain spawn: every new IMMEDIATE job descriptor starts bin/qje-drain.sh in the background, which
+# runs the immediate queue until it is empty (one runner at a time, behind a lock). See the README,
+# "Immediate execution". Tunables (shown with their defaults):
+#
+# Restruct\QueuedJobsEnhancements\Services\DrainSpawner:
+#   enabled: true    # false on a site that runs the immediate queue another way
+#   php_cli: ''      # CLI php binary; the QJE_PHP_CLI env var wins over this
+#   log_file: ''     # append wrapper/runner output here (relative = under TEMP_PATH)
+# Restruct\QueuedJobsEnhancements\Worker\QueueWorker:
+#   linger: 2        # seconds a drain runner keeps looking for new jobs before it exits
+Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor:
+  extensions:
+    - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobDescriptorDrainExtension
+    # Record the queued job currently being processed (+ its memory usage) into $_SERVER, so that a
+    # fatal inside the queue runner can be attributed to a job and step. Without this an OOM alert
+    # says only "GET dev/tasks/ProcessJobQueueTask": the runner, not the job.
+    #
+    # Hooked on the DESCRIPTOR, not the service: QueuedJobService exposes no extension hooks, but it
+    # writes the descriptor after every processed step, so onAfterWrite() is called exactly as often
+    # as the job progresses, for every job, using only supported APIs.
+    #
+    # The keys (QUEUED_JOB, QUEUED_JOB_MEMORY) are rendered by restruct/silverstripe-admintweaks'
+    # EnhancedErrorFormatter (they are in its default `server_vars`). Moved here from admintweaks
+    # in 1.7.0; admintweaks no longer registers its own copy when this class exists.
+    - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobContextExtension
 
 # Self-declaring default jobs ($is_default_job = true) are DIAGNOSTIC ONLY — this module
 # does not create or schedule them. Core already does that: QueuedJobService::runQueue()

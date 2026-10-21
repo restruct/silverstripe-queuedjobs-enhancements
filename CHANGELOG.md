@@ -3,9 +3,91 @@
 All notable changes to this module. Versions before this file existed are described by their
 git tags (1.0.0 to 1.4.0).
 
+## 1.7.0 (2026-10-21)
+
+Drain spawn: the immediate queue runs within about a second of a
+dispatch, with nothing resident. The resident worker mode of 1.6.0 is removed.
+
+### Added
+
+- `QueuedJobDescriptorDrainExtension` and `DrainSpawner`: every new descriptor on the `IMMEDIATE`
+  queue (however it was queued) touches a marker and starts `bin/qje-drain.sh` detached. The wrapper
+  takes a lock without waiting, so a burst starts one PHP runner; it runs the worker one-shot on the
+  immediate queue and starts another runner when the marker was touched during the run or the
+  runner exited 75. Marker `.qje-spawn/pending` and lock `.qje-spawn/lock` live in a subfolder
+  of upstream's job folder. Config: `DrainSpawner.enabled` (default true; only an explicit
+  `false` switches it off, a missing value such as from a config cache built before the setting
+  existed counts as on), `php_cli`, `log_file`.
+- CLI php binary for the runner: the `QJE_PHP_CLI` environment variable (or `.env` entry), then
+  `DrainSpawner.php_cli`, then the automatic resolution of 1.6.0. php-fpm is never used.
+- Locking in the wrapper: util-linux `flock` with `-E`, else perl's `flock()` (macOS), else
+  unlocked with a warning.
+- Drain runner (`queuedjobs:work` / `QueuedJobsWorkTask`, now one-shot only): exit code 75
+  (`QueueWorker::EXIT_MORE_WORK`) when it stops early after running jobs (max-jobs, max-time,
+  memory, a job parked `Waiting`; a stop signal exits 0), and `linger` (config
+  `QueueWorker.linger`, default 2 s; option `linger`): keep looking for due jobs every 0.5 s before
+  exiting.
+- The runner deletes upstream's trigger file `queuedjob-<ID>` of every job it ran, whatever the
+  outcome (complete, broken or parked `Waiting`). Upstream only deletes it for a completed job.
+- `ImmediateJobRunner::triggerFolder()` and `ImmediateJobRunner::cliPhpBinary()`.
+- `tests/shell/qje-drain-test.sh`: the wrapper against a fake runner, with must-fail mutants.
+- `QueuedJobContextExtension` on `QueuedJobDescriptor`, moved from restruct/silverstripe-admintweaks:
+  while a job's descriptor is `Running`, `$_SERVER['QUEUED_JOB']` (`#ID class | title | step x/y |
+  queue n`) and `$_SERVER['QUEUED_JOB_MEMORY']` (used / peak / memory_limit) name the job, so a
+  fatal in the runner can be attributed to it; cleared on any other status. Same keys and format
+  as before, so admintweaks' `EnhancedErrorFormatter` renders them unchanged.
+- `QueuedJobProfileTask` (`dev/tasks/qjob-profile` on SS5, `sake tasks:qjob-profile` on SS6),
+  moved from restruct/silverstripe-admintweaks: runs a job in-process and reports memory, step,
+  `jobData` size and message count per `process()` call. Dev-only. Admintweaks disables its own copy
+  when this class exists.
+- `BoundedJobMessages`, an opt-in trait for jobs: keeps the first `keep_first_messages` (10) and the
+  last `keep_last_messages` (200) messages with one marker counting the dropped middle (the count
+  survives between steps), so logging in a loop no longer re-serialises an ever larger log after
+  every step. Also opt-in: `min_message_severity` and `message_memory_usage`. Settings are read from
+  the job class.
+
+### Changed
+
+- `ImmediateJobRunner::queueAndRun()` queues the job on the `IMMEDIATE` queue
+  (`queueJob($job, $startAfter, null, QueuedJob::IMMEDIATE)`) and lets the drain spawn run it. The
+  per-job `--job=<ID> --max-jobs=1` spawn is gone; jobs queued from the CLI are drained too.
+- Without `exec()` nothing is spawned (logged once per process); the job waits in the `IMMEDIATE`
+  queue for the cron or another runner.
+- A dispatch inside an open database transaction also drains once at the end of the process, so
+  a commit after the runner's linger does not leave the job for the cron.
+
+### Removed
+
+- The resident (long-running, polling) worker mode of `queuedjobs:work` / `QueuedJobsWorkTask`,
+  and its `sleep` option. The command is now only the one-shot drain runner. No project used the
+  resident mode (mic's decision, 2026-10-15).
+- `queuedjobs:restart` (`QueueRestartCommand`) and `dev/tasks/QueuedJobsRestartTask`, the restart
+  signal for the deploy script.
+- `WorkerRestartSignal` and its table `QueuedJobsWorkerRestartSignal` (the database build leaves an
+  existing table in place; it can be dropped).
+- `_config/worker.yml`: the `queuedjobs:restart` command registration and the
+  `QueuedJobsRestartTask.is_enabled: false` entry.
+- README: the resident worker, Supervisor/daemon example and restart-on-deploy sections.
+- The per-job spawn helpers of `ImmediateJobRunner` (`spawnJobProcess()`, `buildSpawnCommand()`,
+  `wrapWithLock()`, `resolveFlockBinary()`, `isDue()`), unused since the drain spawn. Deprecated
+  earlier in this release, removed rather than kept until the next major, because no project uses
+  them (mic's decision, 2026-10-17).
+- The settings `ImmediateJobRunner.use_immediate_queue` (no effect since the drain spawn; a site
+  with its own watcher sets `DrainSpawner.enabled: false`), `use_spawn_lock`, `spawn_lock_file` and
+  `spawn_lock_timeout`, and the `use_immediate_queue` entry in `_config/config.yml`. Nothing reads
+  them any more; a project YAML line that sets one can be deleted.
+- The single-job mode of the runner: the `job` option of `queuedjobs:work` / `QueuedJobsWorkTask`
+  (`QueueWorker::runSingleJob()`, `QueueWorker::parseJobId()`). Only the per-job spawn used it.
+  `sake queuedjobs:work --job=<ID>` is now rejected as an unknown option.
+- Tests of the removed code: the spawn command and `flock` tests, the `--job` and `parseJobId()`
+  tests, and `ImmediateSpawnRunsOnlyItsJobTest`.
+
+The `stop-when-empty` flag is still accepted (the drain wrapper passes it) and has no effect:
+stopping when empty is the only behaviour.
+
 ## 1.6.0 (2026-10-12)
 
-A Laravel-style queue worker (#5).
+A Laravel-style queue worker.
 
 ### Added
 

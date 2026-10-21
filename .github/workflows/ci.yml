@@ -147,7 +147,7 @@ jobs:
             SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit --testsuite queuedjobs-enhancements
           fi
 
-      - name: Boot the app, build the database, run the module's tasks and the worker
+      - name: Boot the app, build the database, run the module's tasks and the drain runner
         # The suite proves the classes behave; this proves the module does not break a real
         # boot. Before SS6 support, both BuildTasks were a class-load fatal on SS6 that took the
         # whole application down on flush - no unit test can see that from inside a booted run.
@@ -157,19 +157,29 @@ jobs:
             php vendor/silverstripe/framework/cli-script.php dev/build flush=1
             php vendor/silverstripe/framework/cli-script.php dev/tasks/check-default-jobs
             php vendor/silverstripe/framework/cli-script.php dev/tasks/cleanup-broken-jobs
-            # The worker and its restart signal, run for real once: an empty queue must make the
-            # worker exit 0 straight away. `timeout` turns a worker that never stops into a red
-            # leg instead of a job that hangs until GitHub's 6-hour limit.
-            php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsRestartTask
+            # The drain runner, run for real once: an empty queue must make it exit 0 after its
+            # linger. `timeout` turns a runner that never stops into a red leg instead of a job
+            # that hangs until GitHub's 6-hour limit. (queuedjobs:restart was removed in 1.7.0.)
             timeout 120 php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask stop-when-empty=1
           else
             vendor/bin/sake db:build --flush
             vendor/bin/sake tasks:check-default-jobs
             vendor/bin/sake tasks:cleanup-broken-jobs
-            # Same worker smoke run as on SS5 above.
-            vendor/bin/sake queuedjobs:restart
+            # Same drain runner smoke run as on SS5 above.
             timeout 120 vendor/bin/sake queuedjobs:work --stop-when-empty
           fi
+
+  shell:
+    # bin/qje-drain.sh against a fake runner: no PHP or database. ubuntu-latest has util-linux
+    # flock and perl, so both lock variants run here (macOS dev machines only have perl).
+    name: Drain wrapper (bash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Wrapper tests
+        run: bash tests/shell/qje-drain-test.sh
+      - name: Must-fail controls (each broken copy of the wrapper must fail the tests)
+        run: bash tests/shell/qje-drain-test.sh --mutants
 
   lint:
     name: Lint PHP ${{ matrix.php }}

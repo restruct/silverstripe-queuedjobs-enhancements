@@ -1,23 +1,22 @@
 # Design Research & Rationale
 
-This document distills the design thinking behind `restruct/silverstripe-queuedjobs-enhancements` so the module's backup is self-contained. It records **why** each delivered component exists, the alternatives that were considered and rejected, and the SS5→SS6 migration notes. For the roadmap (done vs. planned) see [../PLAN.md](../PLAN.md); for usage see [../README.md](../README.md).
+This document distills the design thinking behind `restruct/silverstripe-queuedjobs-enhancements` so the module's backup is self-contained. It records **why** each delivered component exists, the alternatives that were considered and rejected, and the SS5→SS6 migration notes. For usage and the roadmap see [../README.md](../README.md).
 
 ## Sources
 
-The design was driven by these local documents. **This module does not depend on any of them** — everything needed is captured in this file, `README.md` and `PLAN.md`. Verified inventory (2026-07-02):
+The design was driven by these local documents. **This module does not depend on any of them** — everything needed is captured in this file and `README.md`. Verified inventory (2026-07-02):
 
 **Primary research (Restruct SSKB)**
 - `silverstripe/ideas/queuedjobs-enhancements.md` (~64 KB) — the research doc: problem statement, six proposed "pillars", prior-art survey, a Laravel-feature comparison, and full code sketches + the phased scope (Phases 1/2/5) the module was built from.
 - `silverstripe/topics/queuedjobs.md` (~63 KB) — the SSKB QueuedJobs reference (job lifecycle, config, patterns; the `ss-queuedjobs` agent knowledge base). Source for the shutdown-function / IMMEDIATE-queue analysis in this doc.
 
 **Plans**
-- `PLAN.md` (this repo) — the canonical, evolved plan actually followed (adds `_config/config.yml`, the CLI-spawn `ImmediateJobRunner`).
-- `~/.claude/plans/flickering-finding-sedgewick.md` — an earlier draft (used `fastcgi_finish_request()`, module at project root). Deleted from its original location, but **recovered verbatim from the session transcript** and preserved in this repo as [../PLAN-original-draft.md](../PLAN-original-draft.md) (with a provenance header). Fully superseded by `PLAN.md`.
+- The implementation plans were internal working documents and are not part of the published repository.
 
 **SSKB profiles that governed the workflow**
 - `silverstripe/profiles/local-module-dev.md` — the `_dev/` path-repository workflow (the fix for the double-scan bug below).
 - `silverstripe/profiles/composer.md` — path repos + version constraints (`dev-ss5-update`).
-- `silverstripe/profiles/cli-commands.md` — when to flush vs. dev/build; `cli-script.php` over `sake` (cited in `ImmediateJobRunner`).
+- `silverstripe/profiles/cli-commands.md` — when to flush vs. dev/build; `cli-script.php` over `sake` on SS5 (`DrainSpawner` runs the task through `cli-script.php` on SS5 and through `bin/sake` on SS6).
 
 **Consolidation origins (code moved into this module)**
 - `restruct/silverstripe-admintweaks: src/Jobs/ScheduledMethodCall.php` — origin of this module's `ScheduledMethodCall` (present in the working admintweaks copy).
@@ -42,9 +41,9 @@ Each delivered component targets one of these.
 
 These four principles constrained every decision:
 
-1. **Never replace or subclass core QueuedJobs classes.** Overriding `QueuedJobService` / `QueuedJobsAdmin` via Injector is a maintenance and compatibility hazard: upstream changes break the override silently, only one module can override a given class, and you inherit all of the parent's complexity. The Silverstripe-native answer is Extensions plus complementary services — which is what this module uses.
-2. **Play well with existing infrastructure.** If `inotifywait` monitors the IMMEDIATE queue, use it. If a project already has `defaultJobs` YAML, leave it working. Respect the existing job runner rather than competing with it.
-3. **CLI spawn over FPM tricks.** A detached `exec('nohup php … &')` process beats `fastcgi_finish_request()` on every axis that matters (see table below).
+1. **Never replace or subclass core QueuedJobs classes unless there is no hook, and then only opt-in.** Overriding `QueuedJobService` / `QueuedJobsAdmin` via Injector is a maintenance and compatibility hazard: upstream changes break the override silently, only one module can override a given class, and you inherit all of the parent's complexity. The Silverstripe-native answer is Extensions plus complementary services — which is what this module uses. The one exception is `EnhancedQueuedJobService` (the 1.4.0 concurrency guard): `grabMutex()` has no extension point, so it overrides that single method, does nothing unless a job opts in, and is swapped in by a project's own Injector config, never by the module. The 1.7.0 drain spawn keeps to the rule: it is an extension on `QueuedJobDescriptor`, not an Injector replacement.
+2. **Play well with existing infrastructure.** If a site already runs the IMMEDIATE queue with `inotifywait`, the drain spawn is switched off with one setting (`DrainSpawner.enabled: false`). If a project already has `defaultJobs` YAML, leave it working. Respect the existing job runner rather than competing with it.
+3. **CLI spawn over FPM tricks.** A detached `exec('nohup php … &')` process beats `fastcgi_finish_request()` on every axis that matters (see the table in §2). Since 1.7.0 it is one drain runner per burst, not one process per job.
 4. **Traits over base classes.** Jobs already extend `AbstractQueuedJob` (single inheritance is spent); trait-based composition avoids hierarchy conflicts. This principle mainly governs the *planned* `MultiStepJob` / `JobDispatchAction` work.
 
 ## Component rationale
@@ -67,9 +66,49 @@ The JS component is deliberately **framework-free** (no React/jQuery/Vue depende
 
 ### 2. Immediate execution (Pillar 2)
 
-**Decision: spawn a background CLI process; never tie up an FPM worker.**
+**Decision (1.7.0): a drain spawn. Every newly queued IMMEDIATE job makes sure one short-lived CLI runner is draining the immediate queue; nothing stays resident between bursts.**
 
-Why CLI spawn over `fastcgi_finish_request()`:
+#### Why not upstream's own routes
+
+Upstream offers two ways to run the IMMEDIATE queue without waiting for cron, and neither covers a web request on a standard host:
+
+- **`use_shutdown_function`** registers its shutdown handler only under the CLI (`QueuedJobService::__construct()` checks `Director::is_cli()`). An IMMEDIATE job queued from a web request therefore waits for the next CLI process to exit, in practice the next cron tick, exactly like `QueuedJob::QUEUED`.
+- **`inotifywait`** watches the trigger-file folder and starts a runner per event. It needs the `inotify-tools` package (not installed on Forge servers; installing it needs root) and a resident watcher. Upstream's recipe (`inotifywait --monitor ... | sh`) is not a fork bomb under a burst: a single shell reads the pipe, so the runners start one after another and the cost is one full PHP boot per job, in series. It becomes one when the command is backgrounded (`&`) or each event gets its own lock waiter. Not measured here; whether events are lost when the kernel's inotify queue overflows (`fs.inotify.max_queued_events`) is unverified.
+
+#### Options compared
+
+Measured on a Forge test server (Ubuntu 24.04, 1 CPU, PHP 8.3, MySQL 8.4), on an SS5 and an SS6 site, with the job table seeded to 11k rows and cron off:
+
+| Option | Resident while idle | Single-job delay (median, SS5 / SS6) | Burst of 1000 trivial jobs |
+|---|---|---|---|
+| **BASE**, 1.6.0 and earlier: one `nohup flock -w 300 php ... --job=<ID>` per job | nothing | 316 / 387 ms | 1 runner + ~965 lock waiters, ~1.8 GB; **only 432 / 450 jobs ran**: the waiters gave up after the 300 s lock timeout and their jobs stayed New |
+| **A**, 1.6.0 resident worker (`queuedjobs:work --sleep=1` / `3`, polls the DB) | one 64-66 MB PHP process, 60-180 queries/min, 1-3 CPU s per 10 min | 538 / 635 ms (sleep 1) | all 1000, one process |
+| **B**, trigger-folder watcher (bash, 2 s poll, spawns a `--stop-when-empty` runner) | one 3.6 MB bash process, no queries | 1.3 / 1.5 s | all 1000, one process |
+| **C**, drain spawn (1.7.0) | nothing | 346 / 428 ms | all 1000 in 96 / 111 s, one runner process (2 starts) |
+
+Why C over the others:
+
+- **BASE does not scale and loses work.** One process per job behind a lock means a burst piles up lock waiters, and every waiter that times out strands its job until cron.
+- **A pays forever for a latency it barely beats.** A resident PHP process and a query every 0.3-1 s on every site, around the clock, to save a few hundred milliseconds over C, plus a Supervisor program and a restart line in every deploy script.
+- **B has two gaps with real failure modes.** A stopped runner strands its job (the watcher had already deleted the trigger file), and the trigger folder sits under the release directory, so after a zero-downtime deploy the watcher watches the old folder until it is restarted (measured: new jobs stayed New).
+- **C keeps BASE's latency and A's single process**, with nothing resident. The cost per dispatch is one background shell (about 20-30 ms on that 1-CPU box); a dispatch that finds a runner already working starts no PHP at all.
+
+#### How the drain spawn works
+
+1. `QueuedJobDescriptorDrainExtension::onAfterWrite()` fires on the insert of an IMMEDIATE descriptor. The insert is detected with `isChanged('ID')`: the ID is marked changed by the base-record write and the changed fields are cleared only after `onAfterWrite()` (checked in the SS5 and SS6 `DataObject` source). `onAfterWrite()` also fires on every later status write, hence the check. The extension point is the descriptor, not `queueJob()`: `updateJobDescriptorBeforeQueued` runs before the write (no ID yet), and a deduplicated `queueJob()` returns early without starting anything, which is right because the existing job already triggered a drain.
+2. `DrainSpawner` touches a marker file (`.qje-spawn/pending` under the job folder, in a subfolder so upstream's non-recursive `inotifywait` recipe does not see it) and starts `bin/qje-drain.sh` with `nohup ... &`. Under PHP-FPM `PHP_BINARY` is the FPM daemon, so the CLI binary is resolved separately (`QJE_PHP_CLI`, the `php_cli` config, then `phpX.Y` next to `PHP_BINDIR`); php-fpm is never used.
+3. The wrapper takes a non-blocking lock (`flock -n`). If another drain holds it, the wrapper exits at once: that runner will pick the new job up, because the marker was touched before the wrapper started.
+4. With the lock, the wrapper removes the marker and runs one runner (`queuedjobs:work --queue=immediate`) that drains the queue and exits. It loops while the marker has come back (a job queued during the run) or when the runner exits **75**, meaning it stopped early at a limit (max-jobs, max-time, memory) after running jobs. The runner lingers 2 s on an empty queue, so a trickle of jobs is served by one boot.
+
+The exit code 75 closes the gap the 1.6.0 worker had: it returned 0 for every stop, so a drain built on it stranded the rest of the queue when a runner hit a limit (measured: 150 of 300 jobs left New with `max-jobs=50`). With 1.7.0 the same run completes in 7 runner starts with nothing left.
+
+The job is **always queued first**, so cron remains the safety net: if the spawn cannot run (`exec()` disabled, or a transaction that commits long after the dispatch, see the README), or a runner is stopped by a signal, the job waits for the next spawn or the next `ProcessJobQueueTask` tick. A runner stopped by SIGTERM finishes its current step, leaves the job Waiting and exits 0; the next runner resumes it at the next step (measured).
+
+Deploys need nothing: no resident process to restart. A drain still running in the old release finishes beside the new release's drain, and upstream's job lock keeps a job from running twice (measured during a release switch: work shared between the two runners, nothing run twice).
+
+#### Why CLI spawn over `fastcgi_finish_request()`
+
+Unchanged since the first version:
 
 | | `fastcgi_finish_request()` | CLI spawn (`exec`) |
 |-|---------------------------|-------------------|
@@ -80,11 +119,13 @@ Why CLI spawn over `fastcgi_finish_request()`:
 | Memory/time limits | Shared with the request | Own CLI defaults |
 | Isolation | Shares request state | Clean process |
 
-The only cost is ~1–2 s of PHP bootstrap for the spawned process, negligible for background work.
+The cost is one PHP boot per drain: measured at 0.25 s CPU, 0.29 s wall, 64-67 MB.
 
-A crucial finding from the research: **QueuedJobs' own `use_shutdown_function` does not help for web requests.** It is guarded by `!Director::is_cli()` in `QueuedJobService::__construct()`, so the shutdown handler only registers under CLI. Without `inotifywait` running, `QueuedJob::IMMEDIATE` jobs queued from a web request just wait for the next cron tick — identical to `QueuedJob::QUEUED`. That is exactly why this module spawns its own process instead of relying on the IMMEDIATE queue (unless `use_immediate_queue` is explicitly enabled for an inotify setup).
+#### Out of scope: exact-second jobs
 
-The job is **always queued first** as a safety net: if the spawn fails (e.g. `exec()` disabled), cron still runs it. The spawn is best-effort and logs a warning on failure rather than throwing.
+An IMMEDIATE job with a future `StartAfter` (say, something that must run at 14:00:00 exactly) is not served by any upstream immediate route, and the drain runner skips it like upstream's `getNextPendingJob()` does: it runs at the first cron tick after its `StartAfter`. Only a resident DB-polling worker, like 1.6.0's, can hit an exact second, at that worker's idle cost. If a project needs it, that worker could come back as an opt-in.
+
+> **1.6.0 and earlier** spawned one process per job (`--job=<ID>` behind a blocking `flock -w`), offered a resident worker (`--sleep`) with a restart command for deploys, and an opt-in `use_immediate_queue` that only queued on the IMMEDIATE queue for an `inotifywait` setup. All three were removed in 1.7.0; the bench above is why.
 
 ### 3. Self-declaring default jobs (Pillar 5)
 
@@ -178,6 +219,7 @@ The module must live under a directory that Silverstripe's `ModuleManifest` does
 - **Replacing core QueuedJobs classes** — maintenance/compat hazard; Extensions instead.
 - **WebSockets / SSE for progress** — infrastructure cost and FPM-worker exhaustion; polling instead.
 - **`fastcgi_finish_request()` for immediate execution** — SAPI-bound and ties up workers; CLI spawn instead.
+- **A resident worker or watcher for the immediate queue**: a process and (for the worker) a DB poll on every site around the clock, plus a deploy restart; the drain spawn instead (§2). A resident worker remains the only way to run exact-second jobs, a possible later opt-in.
 - **`ThrottledQueuedJobService`** — redundant with the core `NotifiedBroken` flag.
 
 ## Related SSKB resources (for those with access)

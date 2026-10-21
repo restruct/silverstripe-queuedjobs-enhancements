@@ -7,10 +7,10 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 
 /*
- * Version-specific entry point for the Silverstripe 5 worker tasks (QueuedJobsWorkTask,
- * QueuedJobsRestartTask).
+ * Version-specific entry point for the Silverstripe 5 runner task (QueuedJobsWorkTask). (1.6.0 also
+ * had QueuedJobsRestartTask; removed in 1.7.0 with the resident worker mode.)
  *
- * On Silverstripe 6 the worker is a sake command of its own (queuedjobs:work, queuedjobs:restart),
+ * On Silverstripe 6 the runner is a sake command of its own (queuedjobs:work),
  * and these tasks are switched off in _config/worker.yml. They still have to LOAD there, because the
  * task runner reflects on every BuildTask descendant, and BuildTask's shape differs between the
  * majors in ways one class body cannot satisfy. Hence the same pattern as
