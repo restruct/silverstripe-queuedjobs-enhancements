@@ -147,7 +147,12 @@ class BoundedJobMessagesTest extends SapphireTest
     public function testTheDescriptorLogStaysBoundedThroughTheService(): void
     {
         QueuedJobService::config()->set('time_limit', 0);
-        QueuedJobService::config()->set('memory_limit', 0);
+        // QueuedJobService::config()->set('memory_limit', 0);  // old: 0 is not "off"
+        # 0 does not switch the memory check off: getMemoryLimit() then falls back to PHP's own
+        # memory_limit, and where that is unlimited (-1, as on the CI runner) parseMemory() returns
+        # -1, which counts as a limit every job exceeds, so the job was parked Waiting after one
+        # step. A high explicit limit keeps the check out of this test on any machine.
+        QueuedJobService::config()->set('memory_limit', '4G');
         $service = QueuedJobService::singleton();
         $id = $service->queueJob(new StubBoundedMessagesJob(5, 6));
 
