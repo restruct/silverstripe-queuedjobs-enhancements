@@ -25,6 +25,18 @@ After:
 Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor:
   extensions:
     - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobDescriptorDrainExtension
+    # Record the queued job currently being processed (+ its memory usage) into $_SERVER, so that a
+    # fatal inside the queue runner can be attributed to a job and step. Without this an OOM alert
+    # says only "GET dev/tasks/ProcessJobQueueTask": the runner, not the job.
+    #
+    # Hooked on the DESCRIPTOR, not the service: QueuedJobService exposes no extension hooks, but it
+    # writes the descriptor after every processed step, so onAfterWrite() is called exactly as often
+    # as the job progresses, for every job, using only supported APIs.
+    #
+    # The keys (QUEUED_JOB, QUEUED_JOB_MEMORY) are rendered by restruct/silverstripe-admintweaks'
+    # EnhancedErrorFormatter (they are in its default `server_vars`). Moved here from admintweaks
+    # in 1.7.0; admintweaks no longer registers its own copy when this class exists.
+    - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobContextExtension
 
 # Self-declaring default jobs ($is_default_job = true) are DIAGNOSTIC ONLY — this module
 # does not create or schedule them. Core already does that: QueuedJobService::runQueue()
