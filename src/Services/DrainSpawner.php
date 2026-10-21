@@ -76,7 +76,8 @@ class DrainSpawner
     /**
      * Switch the drain spawn off, e.g. on a site that already runs the immediate queue another way
      * (an inotifywait watcher; up to 1.6.0 also a resident queuedjobs:work worker, removed in 1.7.0). The
-     * jobs are queued as IMMEDIATE either way.
+     * jobs are queued as IMMEDIATE either way. Only an explicit false switches it off; a missing
+     * (null) value counts as on.
      */
     private static bool $enabled = true;
 
@@ -103,7 +104,12 @@ class DrainSpawner
      */
     public function requestDrain(): bool
     {
-        if (!static::config()->get('enabled')) {
+        # Only an explicit false switches the drain off. A missing (null) value means on: the
+        # property default is true, so null only shows up when the config was read from a cache
+        # built before this setting existed (seen on SS5: a stale web config cache after a deploy
+        # of 1.7.0). Treating that as "off" silently left every immediate job for the cron.
+        // if (!static::config()->get('enabled')) {  // old: a null (stale cache) value also disabled
+        if (static::config()->get('enabled') === false) {
             return false;
         }
 

@@ -112,6 +112,24 @@ class DrainSpawnerTest extends SapphireTest
     }
 
     /**
+     * Only an explicit false switches the drain off. A missing value (null, as read from a config
+     * cache built before the setting existed) means on.
+     */
+    public function testOnlyAnExplicitFalseSwitchesItOff(): void
+    {
+        Config::modify()->remove(DrainSpawner::class, 'enabled');
+        $this->assertNull(DrainSpawner::config()->get('enabled'), 'precondition: the setting is missing');
+        $this->assertTrue($this->spawner->requestDrain(), 'a missing setting means on');
+
+        Config::modify()->set(DrainSpawner::class, 'enabled', null);
+        $this->assertTrue($this->spawner->requestDrain(), 'null means on');
+
+        Config::modify()->set(DrainSpawner::class, 'enabled', false);
+        $this->assertFalse($this->spawner->requestDrain(), 'false means off');
+        $this->assertCount(2, $this->spawner->commands);
+    }
+
+    /**
      * exec() disabled: nothing is spawned, the job is still queued as IMMEDIATE, and the warning is
      * logged once per process, not once per job.
      */

@@ -180,7 +180,8 @@ is not due yet, so that drain exits after its linger and the cron picks the job 
 ```yaml
 Restruct\QueuedJobsEnhancements\Services\DrainSpawner:
   # false on a site that runs the immediate queue another way (an inotifywait watcher);
-  # jobs are queued as IMMEDIATE either way
+  # jobs are queued as IMMEDIATE either way. Only an explicit false switches it off; a missing
+  # value (e.g. a config cache built before this setting existed) counts as on
   enabled: true
   # CLI php binary; QJE_PHP_CLI wins over this
   php_cli: ''

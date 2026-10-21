@@ -15,7 +15,9 @@ dispatch, with nothing resident. The resident worker mode of 1.6.0 is removed.
   takes a lock without waiting, so a burst starts one PHP runner; it runs the worker one-shot on the
   immediate queue and starts another runner when the marker was touched during the run or the
   runner exited 75. Marker `.qje-spawn/pending` and lock `.qje-spawn/lock` live in a subfolder
-  of upstream's job folder. Config: `DrainSpawner.enabled` (default true), `php_cli`, `log_file`.
+  of upstream's job folder. Config: `DrainSpawner.enabled` (default true; only an explicit
+  `false` switches it off, a missing value such as from a config cache built before the setting
+  existed counts as on), `php_cli`, `log_file`.
 - CLI php binary for the runner: the `QJE_PHP_CLI` environment variable (or `.env` entry), then
   `DrainSpawner.php_cli`, then the automatic resolution of 1.6.0. php-fpm is never used.
 - Locking in the wrapper: util-linux `flock` with `-E`, else perl's `flock()` (macOS), else
