@@ -14,8 +14,8 @@ Progress tracking, immediate execution, and consolidation utilities for [symbiot
 
 | Branch | Module version | Silverstripe | queuedjobs | PHP |
 |---|---|---|---|---|
-| `ss6` (unreleased) | next | 5.4+ and 6 | 5 and 6 | 8.1+ (SS5), 8.3+ (SS6) |
-| `main` | 1.x up to 1.4.0 | 5 only | 5 | 8.1+ |
+| `main` | 1.5.0 and later | 5.4+ and 6 | 5 and 6 | 8.1+ (SS5), 8.3+ (SS6) |
+| tags up to `1.4.0` | 1.0.0 to 1.4.0 | 5 only | 5 | 8.1+ |
 
 Where the two majors differ, the module detects which one is installed and does the right thing:
 the dev tasks have a separate entry point per major (see `src/Tasks/*EntryPoint.php`), and the

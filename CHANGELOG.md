@@ -3,9 +3,9 @@
 All notable changes to this module. Versions before this file existed are described by their
 git tags (1.0.0 to 1.4.0).
 
-## Unreleased
+## 1.7.0 (2026-10-21)
 
-To be released as 1.7.0. Drain spawn: the immediate queue runs within about a second of a
+Drain spawn: the immediate queue runs within about a second of a
 dispatch, with nothing resident. The resident worker mode of 1.6.0 is removed.
 
 ### Added
