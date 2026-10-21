@@ -31,6 +31,20 @@ dispatch, with nothing resident. The resident worker mode of 1.6.0 is removed.
   outcome (complete, broken or parked `Waiting`). Upstream only deletes it for a completed job.
 - `ImmediateJobRunner::triggerFolder()` and `ImmediateJobRunner::cliPhpBinary()`.
 - `tests/shell/qje-drain-test.sh`: the wrapper against a fake runner, with must-fail mutants.
+- `QueuedJobContextExtension` on `QueuedJobDescriptor`, moved from restruct/silverstripe-admintweaks:
+  while a job's descriptor is `Running`, `$_SERVER['QUEUED_JOB']` (`#ID class | title | step x/y |
+  queue n`) and `$_SERVER['QUEUED_JOB_MEMORY']` (used / peak / memory_limit) name the job, so a
+  fatal in the runner can be attributed to it; cleared on any other status. Same keys and format
+  as before, so admintweaks' `EnhancedErrorFormatter` renders them unchanged.
+- `QueuedJobProfileTask` (`dev/tasks/qjob-profile` on SS5, `sake tasks:qjob-profile` on SS6),
+  moved from restruct/silverstripe-admintweaks: runs a job in-process and reports memory, step,
+  `jobData` size and message count per `process()` call. Dev-only. Admintweaks disables its own copy
+  when this class exists.
+- `BoundedJobMessages`, an opt-in trait for jobs: keeps the first `keep_first_messages` (10) and the
+  last `keep_last_messages` (200) messages with one marker counting the dropped middle (the count
+  survives between steps), so logging in a loop no longer re-serialises an ever larger log after
+  every step. Also opt-in: `min_message_severity` and `message_memory_usage`. Settings are read from
+  the job class.
 
 ### Changed
 

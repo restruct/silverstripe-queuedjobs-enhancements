@@ -20,7 +20,7 @@ use Symbiote\QueuedJobs\Services\AbstractQueuedJob;
  *   Silverstripe 6: sake tasks:qjob-profile --class='My\Jobs\SyncJob' --maxcalls=50
  *                   (symfony/console OPTIONS, so the same spelling works on the CLI and in the
  *                   browser task runner)
- *   Silverstripe 5: sake dev/tasks/qjob-profile class=My\Jobs\SyncJob maxcalls=50
+ *   Silverstripe 5: sake dev/tasks/qjob-profile class='My\Jobs\SyncJob' maxcalls=50
  *                   web: dev/tasks/qjob-profile?class=My\Jobs\SyncJob&maxcalls=50
  *
  * NB on Silverstripe 5 the arguments differ by context — on the CLI they are SPACE-SEPARATED, not a

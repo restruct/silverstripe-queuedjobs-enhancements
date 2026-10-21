@@ -39,16 +39,18 @@ vendor/bin/sake db:build --flush
 The module registers:
 
 - A route `api/job-progress//$ID` → `JobProgressController` (via `_config/routes.yml`).
-- Two dev tasks: `check-default-jobs` and `cleanup-broken-jobs` (`dev/tasks/<name>` on Silverstripe 5, `sake tasks:<name>` on Silverstripe 6).
+- Three dev tasks: `check-default-jobs`, `cleanup-broken-jobs` and `qjob-profile` (dev-only) (`dev/tasks/<name>` on Silverstripe 5, `sake tasks:<name>` on Silverstripe 6).
 - The drain runner: `sake queuedjobs:work` on Silverstripe 6, `dev/tasks/QueuedJobsWorkTask` on
   Silverstripe 5 (see [§8](#8-drain-runner-queuedjobswork)). It adds no tables.
 - Exposes `client/` (for `client/js/job-progress.js`) via `extra.expose` in `composer.json`.
-- One extension, `QueuedJobDescriptorDrainExtension` on `QueuedJobDescriptor`: every new job on the
-  `IMMEDIATE` queue starts a background drain (see [§2](#2-immediate-job-execution)). Switch it off
-  with `DrainSpawner.enabled: false`.
+- Two extensions on `QueuedJobDescriptor`: `QueuedJobDescriptorDrainExtension` (every new job on the
+  `IMMEDIATE` queue starts a background drain, see [§2](#2-immediate-job-execution); switch it off
+  with `DrainSpawner.enabled: false`) and `QueuedJobContextExtension` (records the running job in
+  `$_SERVER` for error reports, see [§9](#9-job-context-for-error-reports)).
 
 <!-- It registers no extensions and adds no runtime hooks — nothing runs unless you call it. -->
-Apart from the drain spawn it adds no runtime hooks: nothing else runs unless you call it.
+<!-- Apart from the drain spawn it adds no runtime hooks: nothing else runs unless you call it. -->
+Apart from these two descriptor hooks it adds no runtime hooks: nothing else runs unless you call it.
 
 ## Features
 
@@ -489,6 +491,91 @@ jobs the runner did not run are left alone.
 > `--job=<ID>` mode, which `ImmediateJobRunner` spawned per job up to 1.6.0, was removed in 1.7.0
 > as well.
 
+### 9. Job context for error reports
+
+When a queued job dies of a PHP fatal (typically an OOM), the error report names only the runner
+(`GET dev/tasks/ProcessJobQueueTask`), not the job, and the job never gets to log anything itself.
+`QueuedJobContextExtension` (registered on `QueuedJobDescriptor`, always on) records the job being
+processed in `$_SERVER` after every write of its descriptor, which upstream's service does after
+every step:
+
+```
+QUEUED_JOB         #123 App\Jobs\SyncJob | Nightly sync | step 41/200 | queue 2
+QUEUED_JOB_MEMORY  used 312.4 MB / peak 340.1 MB | php.ini memory_limit 512M
+```
+
+Both keys are cleared as soon as the descriptor is no longer `Running`, so a later error in the
+same runner process is not blamed on a finished job. `$_SERVER` on purpose: it survives into the
+shutdown handler that renders the report, and reading it needs no allocation, which matters when
+the failure is memory exhaustion. The memory figures are from the last completed step, so a single
+step that jumps from well under the limit to a fatal shows exactly that.
+
+restruct/silverstripe-admintweaks' `EnhancedErrorFormatter` renders both keys (they are in its
+default `server_vars`); any other error reporter can read them from `$_SERVER`.
+
+### 10. Queued job profiler (`qjob-profile`)
+
+Runs a job's `setup()` + `process()` loop in-process and prints, per `process()` call, memory
+(+ delta), peak, the real `currentStep`, the serialised `jobData` size and the message count, then
+a summary. It answers "does this job accumulate, and where?". **Dev-only**: it really runs the job,
+so it writes whatever the job writes; outside `dev` it refuses.
+
+```bash
+# Silverstripe 6 (options; the same spelling works in the browser task runner)
+php -d memory_limit=512M vendor/bin/sake tasks:qjob-profile --class='App\Jobs\SyncJob' --maxcalls=50
+# Silverstripe 5 (CLI arguments are space-separated, not a query string)
+php -d memory_limit=512M vendor/silverstripe/framework/cli-script.php dev/tasks/qjob-profile class='App\Jobs\SyncJob' maxcalls=50
+```
+
+Without a class it lists the job classes it can profile; `maxcalls` defaults to 500. Run it with
+the memory limit the cron has, or the result means nothing. Reading it: a delta of about 0 across
+calls means the job does not leak (if it still dies, look at the data, e.g. one query fetching too
+many rows); `jobData` or `msgs` climbing is the accumulator, because both are re-serialised and
+written after every step (see [§11](#11-bounded-job-messages)).
+
+### 11. Bounded job messages
+
+Upstream's `copyJobToDescriptor()` serialises a job's whole message log and writes it to the
+descriptor after every step, so a job that logs inside a loop does work that grows with
+messages x steps: in one production case 21,106 messages (4.29 MB) were re-serialised 3,088 times
+until the runner ran out of memory at about 390 MB. The opt-in `BoundedJobMessages` trait keeps the
+log bounded: the first messages (the setup and context) and the last ones (what the job was doing
+when it stopped), with one marker in between that counts what was dropped.
+
+```php
+use Restruct\QueuedJobsEnhancements\Jobs\BoundedJobMessages;
+
+class SyncJob extends AbstractQueuedJob
+{
+    use BoundedJobMessages;
+}
+```
+
+Settings are read from the **job class** (a `private static` on it, or YAML keyed to it; a subclass
+inherits them). YAML keyed to the trait name has no effect. Defaults shown:
+
+```yaml
+App\Jobs\SyncJob:
+  # 1. bounding, on once the trait is used
+  bound_messages: true
+  keep_first_messages: 10
+  keep_last_messages: 200
+  # %d = the number of messages dropped so far (a text without %d is used as it is)
+  omitted_messages_marker: '... %d earlier message(s) omitted to keep the job log bounded ...'
+  # 2. severity filter, off: e.g. WARNING drops NOTICE, INFO and DEBUG (an unknown severity counts as INFO)
+  min_message_severity: ''
+  # 3. append " [current/peakMB]" to every kept message, off
+  message_memory_usage: false
+```
+
+- The omitted count is kept in the job data, so it survives between steps (and processes), and the
+  previous marker is recognised on the next trim, so the counts add up.
+- Filtered messages are discarded, not counted as omitted. The filter also applies to the messages
+  upstream's service adds to the job.
+- A job that declares its own `addMessage()` overrides the trait's: call
+  `$this->addBoundedMessage($message, $severity)` from it instead of `parent::addMessage()`.
+- The descriptor log becomes a summary. Send what must be kept in full to a PSR logger as well.
+
 ## Dev Tasks
 
 | Task | SS5 segment / SS6 command | Description |
@@ -496,6 +583,7 @@ jobs the runner did not run are left alone.
 | Check Default Jobs | `check-default-jobs` / `tasks:check-default-jobs` | Report declared default jobs and whether they're queued (`yaml=1`, or `--yaml` on SS6, emits the core `defaultJobs` config). Creates nothing. |
 | Cleanup Broken Jobs | `cleanup-broken-jobs` / `tasks:cleanup-broken-jobs` | Delete all broken jobs |
 | Drain runner | `QueuedJobsWorkTask` / `queuedjobs:work` | One-shot runner started by the drain spawn (§8). CLI only. |
+| Profile a queued job | `qjob-profile` / `tasks:qjob-profile` | Run a job in-process and report memory, step, `jobData` size and message count per `process()` call (§10). Dev-only. |
 
 ## Module Structure
 
@@ -506,8 +594,10 @@ src/
 ├── Controllers/
 │   └── JobProgressController.php       # REST API for job progress
 ├── Extensions/
+│   ├── QueuedJobContextExtension.php   # running job -> $_SERVER QUEUED_JOB(_MEMORY)
 │   └── QueuedJobDescriptorDrainExtension.php  # new IMMEDIATE descriptor -> drain spawn
 ├── Jobs/
+│   ├── BoundedJobMessages.php          # Opt-in trait: bounded message log
 │   ├── ScheduledMethodCall.php         # Queue method calls
 │   └── SendEmailJob.php                # Send a composed Email asynchronously
 ├── Services/
@@ -522,6 +612,8 @@ src/
 │   ├── CheckDefaultJobsTaskEntryPoint.php   # run() on SS5 / execute() on SS6
 │   ├── CleanupBrokenJobsTask.php       # Delete broken jobs
 │   ├── CleanupBrokenJobsTaskEntryPoint.php  # run() on SS5 / execute() on SS6
+│   ├── QueuedJobProfileTask.php        # Profile a job in-process (dev-only)
+│   ├── QueuedJobProfileTaskEntryPoint.php   # run() on SS5 / execute() on SS6
 │   ├── QueuedJobsWorkTask.php          # SS5 entry point of queuedjobs:work
 │   └── WorkerTaskEntryPoint.php        # run() on SS5 / disabled stub on SS6
 └── Worker/
@@ -544,7 +636,8 @@ be present, so not a dist install):
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
 # Silverstripe 6 (PHPUnit 11): the flush is an environment variable
 SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
-# expected on both: OK (84 tests, 243 assertions)
+# expected: OK (107 tests, 319 assertions) on SS5, OK (107 tests, 324 assertions) on SS6
+# (the profiler task's exit codes exist, and are asserted, on SS6 only)
 
 # The drain wrapper, no PHP or database needed (every lock tool available here); --mutants checks
 # that four broken copies of the wrapper each fail it
@@ -555,7 +648,7 @@ bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-
 CI (`.github/workflows/ci.yml`) runs the suite on Silverstripe 5 (PHP 8.1 and 8.3) and
 Silverstripe 6 (PHP 8.3), then boots each host, builds the database and runs both dev tasks.
 
-The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
+The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 
 > **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` — the tests follow this convention deliberately.
 
@@ -570,12 +663,19 @@ The suite covers the controller (auth/permission/response shape), `ScheduledMeth
 
 ## Migration from admintweaks
 
-`ScheduledMethodCall` and `CleanupBrokenJobsTask` were consolidated from `restruct/silverstripe-admintweaks`. If you used them from there, update the namespace — the API is identical, only the `use` statement changes:
+`ScheduledMethodCall` and `CleanupBrokenJobsTask` were consolidated from `restruct/silverstripe-admintweaks`; `QueuedJobContextExtension` and `QueuedJobProfileTask` followed in 1.7.0. If you used them from there, update the namespace — the API is identical, only the `use` statement changes:
 
 | Old (admintweaks) | New (this module) |
 |---|---|
 | `Restruct\Silverstripe\AdminTweaks\Jobs\ScheduledMethodCall` | `Restruct\QueuedJobsEnhancements\Jobs\ScheduledMethodCall` |
 | `Restruct\Silverstripe\AdminTweaks\Dev\CleanupBrokenJobsTask` | `Restruct\QueuedJobsEnhancements\Tasks\CleanupBrokenJobsTask` |
+| `Restruct\Silverstripe\AdminTweaks\Extensions\QueuedJobContextExtension` | `Restruct\QueuedJobsEnhancements\Extensions\QueuedJobContextExtension` |
+| `Restruct\Silverstripe\AdminTweaks\Dev\QueuedJobProfileTask` | `Restruct\QueuedJobsEnhancements\Tasks\QueuedJobProfileTask` |
+
+The extension and the profiler need no change in a project: admintweaks (from the releases that
+mark them deprecated) stops registering its extension and disables its task when this module's
+classes exist, so each runs once, under the same task name (`qjob-profile`). With an older
+admintweaks both extensions run; they write the same keys with the same values, which is harmless.
 
 ## Background & research
 
