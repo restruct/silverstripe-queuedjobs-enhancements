@@ -40,6 +40,15 @@ Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor:
     # canView() for the member the job runs as (RunAsID), on top of upstream's ADMIN-only default.
     # Used by JobProgressController; structural, so any other caller of canView() agrees with it.
     - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobDescriptorPermissionExtension
+    # Lock refresh ("lease heartbeat"), OFF by default: after each step of a running job, move its
+    # Expiry to now + worker_ttl, so the health check restarts a job that made no step for
+    # worker_ttl rather than any job running longer than that. Only the process holding the lock
+    # refreshes it. Remove when upstream refreshes the lock itself. Switch on with:
+    #
+    # Restruct\QueuedJobsEnhancements\Extensions\QueuedJobLeaseRefreshExtension:
+    #   enabled: true
+    #   min_interval: 30   # seconds between two refreshes of the same job
+    - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobLeaseRefreshExtension
 
 # Keep ScheduledMethodCall out of upstream's "Create job of type" form in the Jobs admin: its
 # constructor takes (class, method) from that form's textarea, which made it a way to call any
