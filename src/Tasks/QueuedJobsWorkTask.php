@@ -25,6 +25,8 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  * and changes nothing since 1.7.0 (stopping when empty is the only behaviour). The `job=<ID>`
  * single-job mode of 1.6.0 was removed in 1.7.0; the option is no longer read.
  * A leading `--` on an option is accepted too (cli-script strips it), so `--queue=immediate` works.
+ * `requested=1` runs only the jobs queued with ImmediateJobRunner::queueAndStart() (the start request lane of
+ * DrainSpawner::requestStart()) instead of a queue; it needs the `=1`, a bare flag is not read.
  *
  * Silverstripe 6: `sake queuedjobs:work` (QueueWorkCommand); this task is disabled there.
  *

@@ -3,6 +3,29 @@
 All notable changes to this module. Versions before this file existed are described by their
 git tags (1.0.0 to 1.4.0).
 
+## 1.8.0 (2026-10-22)
+
+### Added
+
+- `ImmediateJobRunner::queueAndStart($job, $startAfter = null)`: queue a job on its own queue
+  (normally `Queued`) and start it at once in the background, without moving it to the immediate
+  queue. For long jobs: on the immediate queue, whose cron usually runs every minute, upstream's
+  health check restarts a job whose step takes longer than that interval once its lock
+  (`worker_ttl`, 5 minutes) has expired. The opt-in is per queued job; the same class queued with
+  `queueJob()` waits for its cron. A second lane of the drain spawn (`DrainSpawner::requestStart()`,
+  request files in `.qje-spawn/start/`, its own marker and lock) runs the requests one after the
+  other with the runner's new `requested` mode (`queuedjobs:work --requested`, SS5 `requested=1`).
+- Lock refresh, off by default (`QueuedJobLeaseRefreshExtension.enabled: true`): after each step of
+  a running job, the process that holds its lock moves `Expiry` to now + `worker_ttl`, so the
+  health check restarts a job that made no step for `worker_ttl` instead of any job running longer
+  than that. Throttled by `min_interval` (30 s). Remove it once upstream refreshes the lock itself
+  (it does not, as of 6.2.3).
+
+### Docs
+
+- README: the drain runs immediate jobs one at a time, but the `queue=immediate` cron can start
+  another immediate job beside a busy drain.
+
 ## 1.7.1 (2026-10-22)
 
 Security fixes from a review of 1.7.0.

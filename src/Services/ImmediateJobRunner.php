@@ -23,6 +23,9 @@ use Symbiote\QueuedJobs\Services\QueuedJobService;
  * settings were deprecated by the drain spawn and removed in 1.7.0. What is left besides
  * queueAndRun() serves DrainSpawner: cliPhpBinary() (the CLI php binary) and triggerFolder().
  *
+ * queueAndStart() is the counterpart for a job that must start now but stay on its own (regular)
+ * queue: DrainSpawner::requestStart().
+ *
  * Up to 1.6.0 (no longer applies):
  *
  * Detection order:
@@ -106,6 +109,36 @@ class ImmediateJobRunner
         // }
         //
         // return $descriptorId;
+    }
+
+    /**
+     * Queue a job on its OWN queue (its getJobType(), normally Queued) and start it at once, in the
+     * background, without moving it to the immediate queue. See DrainSpawner::requestStart().
+     *
+     * Use this for a job that must start now but may run long: on the immediate queue, whose cron
+     * usually runs every minute, upstream's health check restarts a job whose step takes longer
+     * than that interval once its lock (worker_ttl, 5 minutes) has expired. On its own queue only
+     * that queue's cron checks it, as for any job the cron started.
+     *
+     * The opt-in is this call, per queued job: the same job class queued with plain queueJob() keeps
+     * waiting for its cron (mic's decision, 2026-10-22: e.g. one CMS button starts two jobs at once,
+     * while the same jobs queued elsewhere run on the cron as usual).
+     *
+     * A future $startAfter is honoured: nothing is started, and the queue's cron runs the job when it
+     * is due. A job with the same signature that is already queued is started if it is still New and
+     * due: queueJob() hands back that descriptor instead of writing a new one, and its start is
+     * requested just the same, because the caller asked for this job to run now. A job whose type is IMMEDIATE is simply drained.
+     *
+     * @return int The QueuedJobDescriptor ID
+     */
+    public static function queueAndStart(QueuedJob $job, ?string $startAfter = null): int
+    {
+        $descriptorId = QueuedJobService::singleton()->queueJob($job, $startAfter);
+
+        # Best effort, as the drain: when nothing can be started the job waits for its cron
+        DrainSpawner::singleton()->requestStart($descriptorId);
+
+        return $descriptorId;
     }
 
     /**
