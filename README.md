@@ -229,6 +229,23 @@ process. Where it is false, upstream writes a `queuedjob-<ID>` trigger file per 
 only deletes it when the job completes; the runner deletes the file of every job it ran, whatever
 the outcome (§8), so broken or parked jobs leave none behind.
 
+**On a server shared with other accounts**, keep both paths out of reach of the others:
+
+- Set `QueuedJobService.cache_dir` to an absolute folder inside the site's own tree, not the
+  relative default under `TEMP_PATH`. `TEMP_PATH` sits under the system temp folder (`/tmp`)
+  unless `SS_TEMP_PATH` or a project `silverstripe-cache/` says otherwise, and Silverstripe makes
+  its parent folder world-writable. Another account that can write there can pre-create or swap
+  the job folder, and so the marker and lock the drain wrapper trusts.
+- Point `DrainSpawner.log_file` (when used) at a folder only the site's account can read: it
+  receives the runners' output, which can include job messages and error text.
+
+```yaml
+Symbiote\QueuedJobs\Services\QueuedJobService:
+  cache_dir: '/home/site/private/queuedjobs'   # absolute, inside the site's own tree
+Restruct\QueuedJobsEnhancements\Services\DrainSpawner:
+  log_file: '/home/site/private/logs/qje-drain.log'
+```
+
 **Transactions.** A job queued inside an open database transaction is invisible to the runner
 until the commit. The drain then runs twice: at once (which covers a commit within the linger) and
 once more at the end of the process (`register_shutdown_function`). So a request or task that
