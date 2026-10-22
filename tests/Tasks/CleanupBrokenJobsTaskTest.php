@@ -132,4 +132,70 @@ class CleanupBrokenJobsTaskTest extends SapphireTest
             );
         }
     }
+
+    /**
+     * Run the task as the browser task runner does and return its HTML: on SS6 through a
+     * PolyOutput in FORMAT_HTML, decorated (as TaskRunner and PolyCommandController create it); on
+     * SS5 through run() with writesHtml() forced on, because Director::is_cli() cannot be faked
+     * under PHPUnit.
+     */
+    protected function runTaskAsHtml(): string
+    {
+        if (!class_exists(PolyOutput::class)) {
+            $task = new class extends CleanupBrokenJobsTask {
+                protected function writesHtml(): bool
+                {
+                    return true;
+                }
+            };
+            ob_start();
+            $task->run(null);
+            return (string) ob_get_clean();
+        }
+
+        $task = CleanupBrokenJobsTask::create();
+        $input = new ArrayInput([], new InputDefinition($task->getOptions()));
+        $input->setInteractive(false);
+        $buffer = new BufferedOutput();
+        $task->run($input, new PolyOutput(PolyOutput::FORMAT_HTML, decorated: true, wrappedOutput: $buffer));
+
+        return $buffer->fetch();
+    }
+
+    protected function writeBrokenJob(string $title): QueuedJobDescriptor
+    {
+        $descriptor = QueuedJobDescriptor::create();
+        $descriptor->Implementation = 'TestJob';
+        $descriptor->JobStatus = QueuedJob::STATUS_BROKEN;
+        $descriptor->JobTitle = $title;
+        $descriptor->write();
+
+        return $descriptor;
+    }
+
+    /**
+     * A job title is free text (often built from user input), and 1.7.0 printed it unescaped in
+     * the browser task runner: OUTPUT_RAW on SS6, a plain echo on SS5. It must arrive as text.
+     */
+    public function testJobTitleIsHtmlEscapedInTheBrowser(): void
+    {
+        $this->writeBrokenJob('<script>x</script>');
+
+        $output = $this->runTaskAsHtml();
+
+        $this->assertStringContainsString('&lt;script&gt;x&lt;/script&gt;', $output);
+        $this->assertStringNotContainsString('<script>', $output);
+    }
+
+    /**
+     * On the CLI the title is printed literally: neither eaten nor applied as a console tag.
+     */
+    public function testJobTitleIsPrintedLiterallyOnTheCli(): void
+    {
+        $this->writeBrokenJob('<error>not a style</error> & <b>');
+
+        $output = $this->runTask(CleanupBrokenJobsTask::create());
+
+        $this->assertStringContainsString('Deleting: <error>not a style</error> & <b> (ID: ', $output);
+    }
 }

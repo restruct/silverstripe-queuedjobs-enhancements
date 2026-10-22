@@ -71,4 +71,45 @@ class CheckDefaultJobsTaskTest extends SapphireTest
         # The report must not be printed in YAML mode
         $this->assertStringNotContainsString('Self-Declaring Default Jobs', $output);
     }
+
+    /**
+     * Run the report as the browser task runner does and return its HTML (see
+     * CleanupBrokenJobsTaskTest::runTaskAsHtml() for the two majors).
+     */
+    protected function runTaskAsHtml(bool $yaml): string
+    {
+        if (!class_exists(PolyOutput::class)) {
+            $task = new class extends CheckDefaultJobsTask {
+                protected function writesHtml(): bool
+                {
+                    return true;
+                }
+            };
+            ob_start();
+            $task->run(new HTTPRequest('GET', 'dev/tasks/check-default-jobs', $yaml ? ['yaml' => '1'] : []));
+            return (string) ob_get_clean();
+        }
+
+        $task = CheckDefaultJobsTask::create();
+        $input = new ArrayInput($yaml ? ['--yaml' => true] : [], new InputDefinition($task->getOptions()));
+        $input->setInteractive(false);
+        $buffer = new BufferedOutput();
+        $task->run($input, new PolyOutput(PolyOutput::FORMAT_HTML, decorated: true, wrappedOutput: $buffer));
+
+        return $buffer->fetch();
+    }
+
+    /**
+     * The task prints config and database values (class names, schedules, job statuses), which
+     * 1.7.0 wrote unescaped into the browser page (OUTPUT_RAW on SS6, a plain echo on SS5). The
+     * YAML block shows the escaping: its quotes must arrive as entities, as any markup would.
+     */
+    public function testOutputIsHtmlEscapedInTheBrowser(): void
+    {
+        $output = $this->runTaskAsHtml(true);
+
+        $this->assertStringContainsString('StubDefaultJob:', $output, 'the YAML block was printed');
+        $this->assertStringContainsString('startTimeString: &#039;+10 minutes&#039;', $output);
+        $this->assertStringNotContainsString("'+10 minutes'", $output);
+    }
 }

@@ -2,8 +2,11 @@
 
 namespace Restruct\QueuedJobsEnhancements\Tasks;
 
+use SilverStripe\Control\Director;
+use SilverStripe\Core\Convert;
 use SilverStripe\PolyExecution\PolyOutput;
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Formatter\OutputFormatter;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 
@@ -40,8 +43,13 @@ if (class_exists(PolyOutput::class)) {
         protected function execute(InputInterface $input, PolyOutput $output): int
         {
             $this->check(function (string $message) use ($output): void {
-                # OUTPUT_RAW: YAML and class names must not be read as console formatting tags
-                $output->writeln($message, PolyOutput::OUTPUT_RAW);
+                # YAML, class names and job statuses: escaped as console tags and written NORMAL,
+                # so they print literally on the CLI and are HTML-escaped by the browser task
+                # runner's HTML formatter
+                // old: OUTPUT_RAW also skips the HTML formatter, so markup reached the browser
+                // # OUTPUT_RAW: YAML and class names must not be read as console formatting tags
+                // $output->writeln($message, PolyOutput::OUTPUT_RAW);
+                $output->writeln(OutputFormatter::escape($message));
             }, (bool) $input->getOption('yaml'));
 
             return Command::SUCCESS;
@@ -67,10 +75,23 @@ if (class_exists(PolyOutput::class)) {
          */
         public function run($request)
         {
-            # Echo through output()'s fallback, exactly as before the split
-            $this->check(function (string $message): void {
-                echo $message . PHP_EOL;
+            # Echo through output()'s fallback, exactly as before the split; HTML-escaped when
+            # the task runs in a browser, where the task runner's page is HTML
+            $html = $this->writesHtml();
+            $this->check(function (string $message) use ($html): void {
+                // old: echoed as is, also in the browser
+                // echo $message . PHP_EOL;
+                echo ($html ? Convert::raw2xml($message) : $message) . PHP_EOL;
             }, (bool) ($request && $request->getVar('yaml')));
+        }
+
+        /**
+         * Whether the output is a browser page (dev/tasks over HTTP) rather than a terminal. A
+         * method so that a test can pretend to be a browser: Director::is_cli() asks the SAPI.
+         */
+        protected function writesHtml(): bool
+        {
+            return !Director::is_cli();
         }
     }
 }
