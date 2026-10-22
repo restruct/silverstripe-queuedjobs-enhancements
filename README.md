@@ -717,7 +717,7 @@ admintweaks both extensions run; they write the same keys with the same values, 
 
 This module was designed and evaluated in a longer research document before implementation. It realizes **Phases 1, 2 and 5** of that research (progress tracking, immediate execution, self-declaring default jobs, and the admintweaks consolidation). The design rationale, alternatives that were considered and rejected (WebSockets/SSE, FPM shutdown tricks, replacing core classes), and the SS5→SS6 closure-library migration notes are distilled in [docs/RESEARCH.md](docs/RESEARCH.md).
 
-The full original evaluation is archived in the Restruct SSKB at `silverstripe/ideas/queuedjobs-enhancements.md`. That path is a pointer only — this module does not depend on it, and [docs/RESEARCH.md](docs/RESEARCH.md) is self-contained.
+The full original evaluation is kept in internal research notes. This module does not depend on them, and [docs/RESEARCH.md](docs/RESEARCH.md) is self-contained.
 
 ## Roadmap
 
