@@ -3,6 +3,49 @@
 All notable changes to this module. Versions before this file existed are described by their
 git tags (1.0.0 to 1.4.0).
 
+## 1.7.1 (2026-10-22)
+
+Security fixes from a review of 1.7.0.
+
+### Security
+
+- Stored XSS in the browser task runner: `CleanupBrokenJobsTask` printed job titles unescaped
+  (Silverstripe 6 through `OUTPUT_RAW`, which skips the HTML formatter; Silverstripe 5 through a
+  plain echo into the HTML page). `CheckDefaultJobsTask` wrote its report the same way. Both now
+  escape console tags and write `NORMAL` on Silverstripe 6, and HTML-escape browser output on
+  Silverstripe 5.
+- `QueuedJobProfileTask` checked `Director::isDev()` only, and in dev mode `dev/tasks` is open to
+  any visitor, so an anonymous request could run any job class. It now also requires the CLI or
+  ADMIN. Its browser output is HTML-escaped (Silverstripe 5 reflected the `class` parameter raw).
+- `ScheduledMethodCall` could be created from upstream's "Create job of type" form in the Jobs
+  admin with (class, method) as constructor lines, which called any static method.
+  `QueuedJobsAdminJobTypesExtension` removes it (and subclasses) from that dropdown, which also
+  makes the form reject a crafted POST. More classes: `hidden_job_types`.
+- Progress endpoint (`api/job-progress/<ID>`): a non-admin now gets `"message": "Job failed"` for
+  a `Broken` job instead of its last message, which is often exception text; ADMIN still gets the
+  real message. A job the member may not view answers `404` like a missing one, not `403`, so IDs
+  cannot be probed. The `RunAsID` rule moved from the controller into
+  `QueuedJobDescriptorPermissionExtension::canView()` on the model (returns `true` for the RunAs
+  member, `null` otherwise, so it never overrides a `false` and leaves the rest to upstream's
+  ADMIN default).
+- `bin/qje-drain.sh` could loop for ever: an undeletable marker (folder not writable, read-only
+  filesystem) started a PHP runner on every pass, and a lock file that could not be opened made it
+  hot-spin. A marker that cannot be removed now stops it before the runner starts; a failure exit
+  gets one more pass for a job queued meanwhile, then stops; every further pass waits 0.2 s; and
+  `QJE_DRAIN_MAX_PASSES` (default 50) caps the runs. Each stop exits 70 with the reason on stderr.
+- CI: the workflow token is `contents: read`, and the actions are pinned to commit SHAs
+  (`actions/checkout` v7.0.1, `shivammathur/setup-php` 2.40.0).
+
+### Changed (possibly breaking)
+
+- `api/job-progress/<ID>` answers `404` instead of `403` for a job the member may not view, and
+  `message` is `"Job failed"` for a `Broken` job seen by a non-admin. A client that told the two
+  cases apart by status code can no longer do so.
+- `bin/qje-drain.sh` can exit `70` (see above); before it only exited `0` or `64`.
+- README: a note for servers shared with other accounts (an absolute `QueuedJobService.cache_dir`
+  outside `/tmp`, a private `DrainSpawner.log_file`). README, `docs/RESEARCH.md` and code
+  comments no longer point at internal research notes by path; they cite upstream source instead.
+
 ## 1.7.0 (2026-10-21)
 
 Drain spawn: the immediate queue runs within about a second of a

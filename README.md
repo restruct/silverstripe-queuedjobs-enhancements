@@ -689,11 +689,13 @@ be present, so not a dist install):
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
 # Silverstripe 6 (PHPUnit 11): the flush is an environment variable
 SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
-# expected: OK (107 tests, 319 assertions) on SS5, OK (107 tests, 324 assertions) on SS6
+# expected: OK (122 tests, 359 assertions) on SS5, OK (122 tests, 365 assertions) on SS6
 # (the profiler task's exit codes exist, and are asserted, on SS6 only)
 
-# The drain wrapper, no PHP or database needed (every lock tool available here); --mutants checks
-# that seven broken copies of the wrapper each fail it
+# The drain wrapper, no PHP or database needed (every lock tool available here): the marker and
+# exit-75 loops, the busy-lock exit, and the bounds (undeletable marker, unopenable lock, a runner
+# that keeps failing, QJE_DRAIN_MAX_PASSES); --mutants checks that seven broken copies of the
+# wrapper each fail it
 bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-test.sh
 bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-test.sh --mutants
 ```
@@ -701,7 +703,7 @@ bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-
 CI (`.github/workflows/ci.yml`) runs the suite on Silverstripe 5 (PHP 8.1 and 8.3) and
 Silverstripe 6 (PHP 8.3), then boots each host, builds the database and runs both dev tasks.
 
-The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
+The suite covers the controller (auth/permission/response shape, `404` for a job the member may not view, the generic message of a `Broken` job for non-admins), the RunAs `canView()` extension, the Jobs admin create-job form (`ScheduledMethodCall` not offered, a crafted POST refused), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask` and `CheckDefaultJobsTask` (output HTML-escaped in the browser), `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal, the CLI-or-ADMIN refusal over HTTP, escaped browser output), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 
 > **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` — the tests follow this convention deliberately.
 
