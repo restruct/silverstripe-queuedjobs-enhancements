@@ -15,6 +15,11 @@ git tags (1.0.0 to 1.4.0).
   `queueJob()` waits for its cron. A second lane of the drain spawn (`DrainSpawner::requestStart()`,
   request files in `.qje-spawn/start/`, its own marker and lock) runs the requests one after the
   other with the runner's new `requested` mode (`queuedjobs:work --requested`, SS5 `requested=1`).
+- Lock refresh, off by default (`QueuedJobLeaseRefreshExtension.enabled: true`): after each step of
+  a running job, the process that holds its lock moves `Expiry` to now + `worker_ttl`, so the
+  health check restarts a job that made no step for `worker_ttl` instead of any job running longer
+  than that. Throttled by `min_interval` (30 s). Remove it once upstream refreshes the lock itself
+  (it does not, as of 6.2.3).
 
 ### Docs
 

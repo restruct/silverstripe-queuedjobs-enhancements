@@ -242,6 +242,9 @@ start, nor the other way around.
 - The same switches and guards as the drain: `DrainSpawner.enabled: false`, no `exec()`, a test
   database. In each case the job simply waits for its cron.
 
+The underlying cause (an expiry that is never moved forward) also affects long jobs on the regular
+queue, only far less often. The opt-in lock refresh (§12) addresses it on every queue.
+
 **Requirements**
 
 | | |
@@ -684,6 +687,37 @@ App\Jobs\SyncJob:
   `$this->addBoundedMessage($message, $severity)` from it instead of `parent::addMessage()`.
 - The descriptor log becomes a summary. Send what must be kept in full to a PSR logger as well.
 
+### 12. Lock refresh (`QueuedJobLeaseRefreshExtension`, off by default)
+
+Upstream sets a running job's lock expiry (`Expiry`) once, when a runner takes the job, to
+`QueuedJobService.worker_ttl` (5 minutes) ahead, and never moves it forward. The health check at the
+start of every `ProcessJobQueueTask` run restarts a `Running` job when it made no step since the
+previous check and that expiry has passed. So any job running longer than `worker_ttl` is restarted
+during a step that spans two health checks, while the first process still runs it (see §2,
+"Starting a regular job at once", for the immediate-queue case).
+
+With the lock refresh on, every step write of a running job by the process that holds its lock
+moves `Expiry` to now + `worker_ttl` again. Stall detection then means "no step for `worker_ttl`"
+instead of "running longer than `worker_ttl`". A single step longer than `worker_ttl` can still be
+restarted, as before.
+
+```yaml
+Restruct\QueuedJobsEnhancements\Extensions\QueuedJobLeaseRefreshExtension:
+  enabled: true
+  # seconds between two refreshes of the same job (0 = every step); a fast job writes its
+  # descriptor many times a second, and against a 5-minute worker_ttl 30 s leaves ample margin
+  min_interval: 30
+```
+
+Only the lock holder refreshes: on the `Initialising` write that follows upstream's `grabMutex()` in
+the same process, the extension reads the lock token (`Worker`) back and keeps it, and each refresh
+is a raw `UPDATE ... WHERE ID = ? AND Worker = ? AND JobStatus = 'Running'`. It never calls the
+write hooks again, and it never extends a lock another process took over. Another process writing a
+running descriptor (the CMS, a script) holds no token and changes nothing.
+
+It is off by default because it changes how stuck jobs are detected on every queue of the site.
+**Remove it once upstream refreshes the lock itself**; upstream has no such refresh today (6.2.3).
+
 ## Dev Tasks
 
 | Task | SS5 segment / SS6 command | Description |
@@ -703,6 +737,7 @@ src/
 │   └── JobProgressController.php       # REST API for job progress
 ├── Extensions/
 │   ├── QueuedJobContextExtension.php   # running job -> $_SERVER QUEUED_JOB(_MEMORY)
+│   ├── QueuedJobLeaseRefreshExtension.php  # opt-in: move a running job's Expiry forward per step
 │   └── QueuedJobDescriptorDrainExtension.php  # new IMMEDIATE descriptor -> drain spawn
 ├── Jobs/
 │   ├── BoundedJobMessages.php          # Opt-in trait: bounded message log
@@ -744,7 +779,7 @@ be present, so not a dist install):
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
 # Silverstripe 6 (PHPUnit 11): the flush is an environment variable
 SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
-# expected: OK (143 tests, 455 assertions) on SS5, OK (143 tests, 461 assertions) on SS6
+# expected: OK (150 tests, 470 assertions) on SS5, OK (150 tests, 476 assertions) on SS6
 # (the profiler task's exit codes exist, and are asserted, on SS6 only)
 
 # The drain wrapper, no PHP or database needed (every lock tool available here): the marker and
