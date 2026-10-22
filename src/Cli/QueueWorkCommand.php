@@ -71,6 +71,7 @@ class QueueWorkCommand extends PolyCommand
                     # stop-when-empty is not passed on: since 1.7.0 it is the only behaviour
                     // 'stop-when-empty' => $input->getOption('stop-when-empty'),  // old
                     'linger' => $input->getOption('linger'),
+                    'requested' => $input->getOption('requested'),
                 ],
                 function (string $message) use ($output): void {
                     # OUTPUT_RAW: job titles are free text and must not be read as console tags
@@ -109,6 +110,8 @@ class QueueWorkCommand extends PolyCommand
             # No default here: an absent option falls back to the QueueWorker.linger config
             // new InputOption('linger', null, InputOption::VALUE_REQUIRED, 'With --stop-when-empty: seconds to keep looking for new jobs before exiting (default: the QueueWorker.linger config, 2; 0 = exit at once)'),
             new InputOption('linger', null, InputOption::VALUE_REQUIRED, 'Seconds to keep looking for new jobs before exiting when the queue is empty (default: the QueueWorker.linger config, 2; 0 = exit at once)'),
+            # The start request lane of the drain spawn (DrainSpawner::requestStart())
+            new InputOption('requested', null, InputOption::VALUE_NONE, 'Run only the jobs that asked to start at once (queued with ImmediateJobRunner::queueAndStart()), whatever their queue, instead of --queue'),
         ];
     }
 }

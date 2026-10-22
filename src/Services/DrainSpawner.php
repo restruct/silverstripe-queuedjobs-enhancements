@@ -9,6 +9,9 @@ use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\Core\Injector\Injector;
 use SilverStripe\ORM\Connect\TempDatabase;
 use SilverStripe\ORM\DB;
+use SilverStripe\ORM\FieldType\DBDatetime;
+use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
+use Symbiote\QueuedJobs\Services\QueuedJob;
 use Throwable;
 
 /**
@@ -39,6 +42,20 @@ use Throwable;
  * Best effort. When exec() is disabled, or the command cannot be built, nothing is started and the
  * job simply waits in the IMMEDIATE queue for whatever else runs it (cron, a worker, upstream's own
  * shutdown drain on CLI).
+ *
+ * Start requests (requestStart()): the same machinery for a job on the Queued or Large queue that
+ * was queued through ImmediateJobRunner::queueAndStart(), the per-job opt-in. The job STAYS on its own queue, so only that queue's cron
+ * runs a health check on it: on the immediate queue, whose cron usually runs every minute, the
+ * health check restarts a job with a step longer than that interval once its lock has expired
+ * (worker_ttl, 5 minutes), which a long multi-step job cannot avoid. Only the jobs that asked are
+ * started; every other regular job keeps waiting for its cron. Each request is a file named after
+ * the descriptor ID in `.qje-spawn/start/`, so no database column is needed. A second wrapper
+ * lane, with its own marker (`.qje-spawn/start-pending`) and lock (`.qje-spawn/start-lock`), runs
+ * the runner in its `requested` mode, which runs only the requested descriptors. The order is the
+ * same as for a drain, and so is the argument that no request is lost: the row is written, then the
+ * request file, then the marker is touched, then the wrapper starts. A request written after the
+ * runner's last look at the request folder has touched the marker after the wrapper removed it, so
+ * the wrapper starts another runner for it.
  *
  * @config bool $enabled
  * @config string $php_cli
@@ -74,6 +91,18 @@ class DrainSpawner
     public const LOCK_FILE = 'lock';
 
     /**
+     * Start requests (see requestStart()): a subfolder of SPAWN_FOLDER with one file per requested
+     * descriptor, named after its ID, plus the marker and lock of their own wrapper lane. Separate
+     * from MARKER_FILE and LOCK_FILE, so a long immediate drain never holds up a start request, and
+     * the other way around.
+     */
+    public const START_FOLDER = 'start';
+
+    public const START_MARKER_FILE = 'start-pending';
+
+    public const START_LOCK_FILE = 'start-lock';
+
+    /**
      * Switch the drain spawn off, e.g. on a site that already runs the immediate queue another way
      * (an inotifywait watcher; up to 1.6.0 also a resident queuedjobs:work worker, removed in 1.7.0). The
      * jobs are queued as IMMEDIATE either way. Only an explicit false switches it off; a missing
@@ -99,10 +128,41 @@ class DrainSpawner
     /** @var bool the end-of-process drain for dispatches inside a transaction is registered */
     protected static bool $shutdownDrainRegistered = false;
 
+    /** @var array<int, true> descriptor IDs whose start this process already requested */
+    protected static array $startRequested = [];
+
+    /** @var array<int, true> start requests made inside a transaction, written at shutdown */
+    protected static array $deferredStarts = [];
+
+    /** @var bool the end-of-process start for requests inside a transaction is registered */
+    protected static bool $shutdownStartRegistered = false;
+
     /**
      * Start a drain now. Returns whether a drain was started.
      */
     public function requestDrain(): bool
+    {
+        # old: the guards below were inline here; moved to spawnAllowed(), unchanged, so that
+        # requestStart() applies exactly the same ones
+        if (!$this->spawnAllowed()) {
+            return false;
+        }
+
+        # Inside a transaction the row is invisible to the runner until the commit: drain again at
+        # the end of this process, once, however many jobs it queues (see the class docblock).
+        if ($this->inTransaction() && !static::$shutdownDrainRegistered) {
+            static::$shutdownDrainRegistered = true;
+            $this->registerShutdown([$this, 'runDeferredDrain']);
+        }
+
+        return $this->spawn();
+    }
+
+    /**
+     * Whether this process may start a background runner at all: the switch, exec(), and never on a
+     * test database. Shared by requestDrain() and requestStart().
+     */
+    protected function spawnAllowed(): bool
     {
         # Only an explicit false switches the drain off. A missing (null) value means on: the
         # property default is true, so null only shows up when the config was read from a cache
@@ -132,14 +192,125 @@ class DrainSpawner
             return false;
         }
 
-        # Inside a transaction the row is invisible to the runner until the commit: drain again at
-        # the end of this process, once, however many jobs it queues (see the class docblock).
-        if ($this->inTransaction() && !static::$shutdownDrainRegistered) {
-            static::$shutdownDrainRegistered = true;
-            $this->registerShutdown([$this, 'runDeferredDrain']);
+        return true;
+    }
+
+    /**
+     * Start one job of the Queued or Large queue now, without moving it to the immediate queue (see
+     * the class docblock). Returns whether a start was requested (at once, or at the end of this
+     * process for a request inside a transaction).
+     *
+     * Nothing is requested for a job that is not due yet (a future StartAfter: its queue's cron
+     * starts it once it is due), that is not New or Waiting any more (it already runs, or ran), or
+     * that this process requested already. An IMMEDIATE job is drained as usual instead.
+     *
+     * @param QueuedJobDescriptor|int $descriptor the descriptor, or its ID
+     */
+    public function requestStart($descriptor): bool
+    {
+        if (!$descriptor instanceof QueuedJobDescriptor) {
+            $descriptor = QueuedJobDescriptor::get()->byID((int) $descriptor);
+        }
+        if (!$descriptor || !$descriptor->ID) {
+            return false;
+        }
+        $id = (int) $descriptor->ID;
+
+        # The immediate queue has its own drain; a second runner for the same job would only lose
+        # the race for upstream's mutex
+        if ((string) $descriptor->JobType === (string) QueuedJob::IMMEDIATE) {
+            return $this->requestDrain();
         }
 
-        return $this->spawn();
+        if (!in_array($descriptor->JobStatus, [QueuedJob::STATUS_NEW, QueuedJob::STATUS_WAIT], true)) {
+            return false;
+        }
+        if (!static::isDue($descriptor->StartAfter)) {
+            # Not due: the runner would skip it anyway (and drop the request). Its queue's cron
+            # picks it up when it is due, exactly as without a start request.
+            return false;
+        }
+
+        # Once per descriptor per process: queueAndStart() of a job with the same signature hands
+        # back the same descriptor, and a second spawn would only cost a bash process and a lock
+        # attempt
+        if (isset(static::$startRequested[$id])) {
+            return true;
+        }
+
+        if (!$this->spawnAllowed()) {
+            return false;
+        }
+        static::$startRequested[$id] = true;
+
+        # Inside a transaction the request is not even written yet: a runner that read it before the
+        # commit would not find the row, and drop the request as stale. So the file is written, and
+        # the runner started, at the end of this process (after the commit of any normal request or
+        # task; after a rollback the runner finds no row and drops the request).
+        if ($this->inTransaction()) {
+            static::$deferredStarts[$id] = true;
+            if (!static::$shutdownStartRegistered) {
+                static::$shutdownStartRegistered = true;
+                $this->registerShutdown([$this, 'runDeferredStarts']);
+            }
+            return true;
+        }
+
+        if (!$this->writeStartRequest($id)) {
+            return false;
+        }
+
+        return $this->spawnStart();
+    }
+
+    /**
+     * The end-of-process start for requests made inside a transaction (see requestStart()). Public
+     * for register_shutdown_function() (and tests).
+     */
+    public function runDeferredStarts(): void
+    {
+        try {
+            $written = false;
+            foreach (array_keys(static::$deferredStarts) as $id) {
+                $written = $this->writeStartRequest((int) $id) || $written;
+            }
+            static::$deferredStarts = [];
+            if ($written) {
+                $this->spawnStart();
+            }
+        } catch (Throwable $e) {
+            # A shutdown function must never turn a finished request into an error page
+            $this->log('Deferred start failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Write the start request file of a descriptor (see requestStart()). Public so the runner's tests
+     * can request a start without the spawn. Returns whether the file was written.
+     */
+    public function writeStartRequest(int $id): bool
+    {
+        $path = $this->startRequestFolder() . '/' . $id;
+        # The content is for a human looking at the folder; only the name is read
+        if (@file_put_contents($path, date('c') . PHP_EOL) === false) {
+            $this->log(sprintf('Could not write the start request %s; job #%d waits for its cron.', $path, $id));
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Whether a StartAfter value is due: empty, or not in the future.
+     */
+    public static function isDue($startAfter): bool
+    {
+        if (!$startAfter) {
+            return true;
+        }
+        $timestamp = strtotime((string) $startAfter);
+
+        return $timestamp === false || $timestamp <= DBDatetime::now()->getTimestamp();
     }
 
     /**
@@ -179,6 +350,26 @@ class DrainSpawner
     }
 
     /**
+     * spawn() for the start request lane: touch its marker, start its wrapper.
+     */
+    protected function spawnStart(): bool
+    {
+        $command = $this->buildStartCommand();
+        if ($command === null) {
+            return false;
+        }
+
+        # Marker after the request file (the caller wrote it): the same order argument as spawn()
+        if (!@touch($this->startMarkerPath())) {
+            $this->log(sprintf('Could not touch the start marker %s; starting anyway.', $this->startMarkerPath()));
+        }
+
+        $this->launch($command);
+
+        return true;
+    }
+
+    /**
      * The full shell command that starts the wrapper detached, or null when it cannot be built.
      */
     public function buildCommand(): ?string
@@ -188,13 +379,38 @@ class DrainSpawner
             return null;
         }
 
+        return $this->wrapperCommand($this->markerPath(), $this->lockPath(), $runner);
+    }
+
+    /**
+     * buildCommand() for the start request lane: the same wrapper with its own marker and lock, and
+     * the runner in its `requested` mode.
+     */
+    public function buildStartCommand(): ?string
+    {
+        $runner = $this->startRunnerCommand();
+        if ($runner === null) {
+            return null;
+        }
+
+        return $this->wrapperCommand($this->startMarkerPath(), $this->startLockPath(), $runner);
+    }
+
+    /**
+     * The detached wrapper command for a marker, a lock and a runner argument list.
+     *
+     * @param string[] $runner
+     */
+    protected function wrapperCommand(string $marker, string $lock, array $runner): ?string
+    {
         $wrapper = static::wrapperPath();
         if (!is_file($wrapper)) {
             $this->log(sprintf('Drain wrapper %s not found; not draining.', $wrapper));
             return null;
         }
 
-        $args = array_merge([$this->bashBinary(), $wrapper, $this->markerPath(), $this->lockPath()], $runner);
+        // $args = array_merge([$this->bashBinary(), $wrapper, $this->markerPath(), $this->lockPath()], $runner);  // old: the immediate lane only
+        $args = array_merge([$this->bashBinary(), $wrapper, $marker, $lock], $runner);
 
         # cd first, in the foreground: the runner's relative paths (none today, but a project's
         # .env loader or a job may use the working directory) then match a run from the project
@@ -219,14 +435,39 @@ class DrainSpawner
      */
     public function runnerCommand(): ?array
     {
+        return $this->runnerFor(['queue=immediate', 'stop-when-empty=1'], ['--queue=immediate', '--stop-when-empty']);
+    }
+
+    /**
+     * The runner of the start request lane: the same worker in its `requested` mode, which runs
+     * only the requested descriptors, whatever their queue.
+     *
+     * @return string[]|null
+     */
+    public function startRunnerCommand(): ?array
+    {
+        return $this->runnerFor(['requested=1', 'stop-when-empty=1'], ['--requested', '--stop-when-empty']);
+    }
+
+    /**
+     * The worker as an argument list, with the given task (Silverstripe 5) or command (6) options.
+     *
+     * @param string[] $taskOptions
+     * @param string[] $commandOptions
+     * @return string[]|null
+     */
+    protected function runnerFor(array $taskOptions, array $commandOptions): ?array
+    {
         $frameworkDir = BASE_PATH . '/vendor/silverstripe/framework';
         $cliScript = $frameworkDir . '/cli-script.php';
         $sakeScript = $frameworkDir . '/bin/sake';
 
         if (file_exists($cliScript)) {
-            $runner = [$cliScript, 'dev/tasks/QueuedJobsWorkTask', 'queue=immediate', 'stop-when-empty=1'];
+            // $runner = [$cliScript, 'dev/tasks/QueuedJobsWorkTask', 'queue=immediate', 'stop-when-empty=1'];  // old: the immediate lane only
+            $runner = array_merge([$cliScript, 'dev/tasks/QueuedJobsWorkTask'], $taskOptions);
         } elseif (file_exists($sakeScript)) {
-            $runner = [$sakeScript, 'queuedjobs:work', '--queue=immediate', '--stop-when-empty'];
+            // $runner = [$sakeScript, 'queuedjobs:work', '--queue=immediate', '--stop-when-empty'];  // old: the immediate lane only
+            $runner = array_merge([$sakeScript, 'queuedjobs:work'], $commandOptions);
         } else {
             $this->log(sprintf('Cannot drain: neither cli-script.php nor bin/sake found in %s', $frameworkDir));
             return null;
@@ -301,6 +542,30 @@ class DrainSpawner
     {
         // return ImmediateJobRunner::triggerFolder() . '/' . static::LOCK_FILE;  // old: in the job folder itself
         return $this->spawnFolder() . '/' . static::LOCK_FILE;
+    }
+
+    /**
+     * The folder of the start request files (see requestStart()), created when it is missing.
+     */
+    public function startRequestFolder(): string
+    {
+        $folder = $this->spawnFolder() . '/' . static::START_FOLDER;
+        if (!is_dir($folder)) {
+            # @: two processes may create it at the same moment
+            @mkdir($folder, 0775, true);
+        }
+
+        return $folder;
+    }
+
+    public function startMarkerPath(): string
+    {
+        return $this->spawnFolder() . '/' . static::START_MARKER_FILE;
+    }
+
+    public function startLockPath(): string
+    {
+        return $this->spawnFolder() . '/' . static::START_LOCK_FILE;
     }
 
     public static function wrapperPath(): string

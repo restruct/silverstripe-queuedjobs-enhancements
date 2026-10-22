@@ -3,6 +3,7 @@
 namespace Restruct\QueuedJobsEnhancements\Worker;
 
 use InvalidArgumentException;
+use Restruct\QueuedJobsEnhancements\Services\DrainSpawner;
 use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Config\Configurable;
@@ -48,6 +49,13 @@ use Throwable;
  *
  * After each job it ran, the runner deletes upstream's trigger file `queuedjob-<ID>` of that job
  * (see deleteTriggerFile()).
+ *
+ * The `requested` mode runs the start requests of DrainSpawner::requestStart() instead of a queue:
+ * only the descriptors that have a request file in DrainSpawner::startRequestFolder(), whatever
+ * their queue, oldest ID first, while they are New (and due) or Waiting (parked by a previous
+ * runner). A request is deleted once its job ran (unless the job was parked again), and so is a
+ * stale one: no such descriptor, a job that is already running, finished or not due. The `queue`
+ * option is not used in that mode. The exit codes are the same.
  *
  * Health checks and default jobs are NOT run here: they belong to ProcessJobQueueTask's runQueue(),
  * which the existing cron keeps calling. The worker is an addition to that cron, not a replacement.
@@ -100,6 +108,8 @@ class QueueWorker
         # seconds to keep looking for new jobs before exiting when the queue is empty.
         # null = the $linger config (default 2); 0 = exit at once
         'linger' => null,
+        # run the start requests (DrainSpawner::requestStart()) instead of the queue(s)
+        'requested' => false,
     ];
 
     /** @var string[] queue type constants (QueuedJob::IMMEDIATE etc), in priority order */
@@ -114,6 +124,9 @@ class QueueWorker
 
     /** @var float seconds; see $linger */
     protected float $lingerSeconds = 0;
+
+    /** @var bool the `requested` mode (see the class doc) */
+    protected bool $requested = false;
 
     /** @var callable function (string $message): void */
     protected $write;
@@ -145,6 +158,8 @@ class QueueWorker
             ? $options['linger']
             : static::config()->get('linger');
         $this->lingerSeconds = max(0.0, (float) $linger);
+        # A flag from the SS6 command (bool) or the SS5 task (a string such as '1')
+        $this->requested = static::isTruthy($options['requested']);
         $this->write = $write ?: function (string $message): void {
             echo $message . PHP_EOL;
         };
@@ -171,10 +186,17 @@ class QueueWorker
         $this->startedAt = DBDatetime::now()->getTimestamp();
         $this->registerSignalHandlers();
 
+        // $this->output(sprintf(
+        //     'Worker started (pid %d) on queue(s) %s',
+        //     getmypid(),
+        //     implode(',', array_map([static::class, 'queueName'], $this->queues))
+        // ));  // old: before the requested mode
         $this->output(sprintf(
-            'Worker started (pid %d) on queue(s) %s',
+            'Worker started (pid %d) on %s',
             getmypid(),
-            implode(',', array_map([static::class, 'queueName'], $this->queues))
+            $this->requested
+                ? 'requested jobs'
+                : 'queue(s) ' . implode(',', array_map([static::class, 'queueName'], $this->queues))
         ));
 
         # Microtime, not DBDatetime: a mocked "now" in tests would never move on and linger forever
@@ -217,6 +239,10 @@ class QueueWorker
             $lingerUntil = null;
 
             $this->runOneJob($service, (int) $descriptor->ID);
+
+            if ($this->requested) {
+                $this->settleRequest((int) $descriptor->ID);
+            }
 
             # A job left Waiting was parked by runJob() because memory or time ran out (or because
             # we asked it to stop after its step). It needs a fresh process to continue, so this
@@ -263,6 +289,10 @@ class QueueWorker
      */
     protected function nextJob(QueuedJobService $service): ?QueuedJobDescriptor
     {
+        if ($this->requested) {
+            return $this->nextRequestedJob();
+        }
+
         foreach ($this->queues as $queue) {
             $descriptor = $service->getNextPendingJob($queue);
             if ($descriptor) {
@@ -271,6 +301,74 @@ class QueueWorker
         }
 
         return null;
+    }
+
+    /**
+     * The next requested descriptor that can run (see the class doc), oldest ID first. Stale requests
+     * found on the way are deleted. Not upstream's getNextPendingJob(): that one picks the next job of
+     * a whole queue, and this mode must run only the jobs that asked.
+     */
+    protected function nextRequestedJob(): ?QueuedJobDescriptor
+    {
+        foreach ($this->requestedIds() as $id) {
+            # Fresh read, never the get_by_id cache: another process may have started the job
+            $descriptor = QueuedJobDescriptor::get()->filter('ID', $id)->first();
+            if (!$descriptor) {
+                # Deleted, or never committed (a rolled-back transaction)
+                $this->deleteRequest($id);
+                continue;
+            }
+            if ($descriptor->JobStatus === QueuedJob::STATUS_WAIT) {
+                # Parked by a previous runner (memory, time, a stop signal): resume it
+                return $descriptor;
+            }
+            if ($descriptor->JobStatus === QueuedJob::STATUS_NEW && DrainSpawner::isDue($descriptor->StartAfter)) {
+                return $descriptor;
+            }
+            # Running or Initialising (the cron or another runner has it), finished, broken, paused,
+            # or New with a StartAfter moved into the future: its queue's cron owns it now
+            $this->deleteRequest($id);
+        }
+
+        return null;
+    }
+
+    /**
+     * After a requested job ran: drop its request unless runJob() parked it as Waiting (the next
+     * runner resumes it, see run()). Also dropped when the job is still New, which means runJob() did
+     * not get its mutex (another process had just taken it); keeping that request would make this
+     * runner pick the same job again and again.
+     */
+    protected function settleRequest(int $jobId): void
+    {
+        if (!$this->isWaiting($jobId)) {
+            $this->deleteRequest($jobId);
+        }
+    }
+
+    /**
+     * IDs of the start request files, ascending. Anything in the folder that is not a plain number
+     * is ignored (and left alone).
+     *
+     * @return int[]
+     */
+    protected function requestedIds(): array
+    {
+        $folder = DrainSpawner::singleton()->startRequestFolder();
+        $ids = [];
+        foreach ((array) @scandir($folder) as $name) {
+            if (is_string($name) && ctype_digit($name) && (int) $name > 0) {
+                $ids[] = (int) $name;
+            }
+        }
+        sort($ids);
+
+        return $ids;
+    }
+
+    protected function deleteRequest(int $jobId): void
+    {
+        @unlink(DrainSpawner::singleton()->startRequestFolder() . '/' . $jobId);
     }
 
     /**
@@ -536,6 +634,18 @@ class QueueWorker
             default:
                 return (int) round($number);
         }
+    }
+
+    /**
+     * A flag option: true, 1, '1', 'true', 'yes' or 'on'.
+     */
+    protected static function isTruthy($value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        return in_array(strtolower(trim((string) $value)), ['1', 'true', 'yes', 'on'], true);
     }
 
     public static function queueName(string $queue): string
