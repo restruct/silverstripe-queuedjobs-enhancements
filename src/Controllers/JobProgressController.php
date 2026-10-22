@@ -5,6 +5,8 @@ namespace Restruct\QueuedJobsEnhancements\Controllers;
 use SilverStripe\Control\Controller;
 use SilverStripe\Control\HTTPRequest;
 use SilverStripe\Control\HTTPResponse;
+use SilverStripe\Security\Member;
+use SilverStripe\Security\Permission;
 use SilverStripe\Security\Security;
 use Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor;
 use Symbiote\QueuedJobs\Services\QueuedJob;
@@ -14,6 +16,11 @@ use Symbiote\QueuedJobs\Services\QueuedJob;
  * Returns JSON with job status, progress percentage, and latest message.
  *
  * Usage: GET /api/job-progress/{descriptorID}
+ *
+ * Access is $descriptor->canView($member): ADMIN, or the member the job runs as (through
+ * QueuedJobDescriptorPermissionExtension). A job the member may not view answers exactly like a
+ * job that does not exist (404), so descriptor IDs cannot be probed. The last message of a Broken
+ * job can carry exception text, so only ADMIN gets it; others get BROKEN_MESSAGE instead.
  *
  * @config string $url_segment
  * @config array $url_handlers
@@ -27,6 +34,11 @@ class JobProgressController extends Controller
         QueuedJob::STATUS_BROKEN,
         QueuedJob::STATUS_CANCELLED,
     ];
+
+    /**
+     * What a non-admin gets as `message` for a Broken job, instead of its last message.
+     */
+    public const BROKEN_MESSAGE = 'Job failed';
 
     private static string $url_segment = 'api/job-progress';
 
@@ -56,12 +68,19 @@ class JobProgressController extends Controller
             return $this->jsonResponse(['error' => 'Job not found'], 404);
         }
 
-        # Permission check — must be admin or the member who queued the job
+        # Permission check: ADMIN, or the member the job runs as. The RunAs rule is now part of
+        # canView() itself (QueuedJobDescriptorPermissionExtension), so every caller of canView()
+        # agrees. Not permitted answers like not found: a 403 told a caller the ID exists.
+        // old: the RunAs fallback lived here, and a refusal was a distinguishable 403
+        // # Permission check — must be admin or the member who queued the job
+        // if (!$descriptor->canView($member)) {
+        //     # Fallback: allow if this member is the RunAs user
+        //     if ((int) $descriptor->RunAsID !== (int) $member->ID) {
+        //         return $this->jsonResponse(['error' => 'Not authorised'], 403);
+        //     }
+        // }
         if (!$descriptor->canView($member)) {
-            # Fallback: allow if this member is the RunAs user
-            if ((int) $descriptor->RunAsID !== (int) $member->ID) {
-                return $this->jsonResponse(['error' => 'Not authorised'], 403);
-            }
+            return $this->jsonResponse(['error' => 'Job not found'], 404);
         }
 
         $isTerminal = in_array($descriptor->JobStatus, self::TERMINAL_STATUSES);
@@ -77,11 +96,28 @@ class JobProgressController extends Controller
             'percent' => $totalSteps > 0
                 ? round(($stepsProcessed / $totalSteps) * 100)
                 : 0,
-            'message' => $this->getLastMessageText($descriptor),
+            // old: the last message for everyone, also a Broken job's exception text
+            // 'message' => $this->getLastMessageText($descriptor),
+            'message' => $this->getMessageFor($descriptor, $member),
             'complete' => $isTerminal,
             'started' => $descriptor->JobStarted,
             'finished' => $isTerminal ? $descriptor->JobFinished : null,
         ]);
+    }
+
+    /**
+     * The `message` to return to this member: the last message, except for a Broken job seen by a
+     * non-admin. A Broken job's last message is often the exception that broke it (upstream
+     * stores the exception message; ScheduledMethodCall logs "Class::method ERROR: <message>"),
+     * which can expose paths, SQL or other internals to the member who merely queued the job.
+     */
+    protected function getMessageFor(QueuedJobDescriptor $descriptor, Member $member): ?string
+    {
+        if ($descriptor->JobStatus === QueuedJob::STATUS_BROKEN && !Permission::checkMember($member, 'ADMIN')) {
+            return static::BROKEN_MESSAGE;
+        }
+
+        return $this->getLastMessageText($descriptor);
     }
 
     /**

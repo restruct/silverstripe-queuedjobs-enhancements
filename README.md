@@ -43,14 +43,17 @@ The module registers:
 - The drain runner: `sake queuedjobs:work` on Silverstripe 6, `dev/tasks/QueuedJobsWorkTask` on
   Silverstripe 5 (see [§8](#8-drain-runner-queuedjobswork)). It adds no tables.
 - Exposes `client/` (for `client/js/job-progress.js`) via `extra.expose` in `composer.json`.
-- Two extensions on `QueuedJobDescriptor`: `QueuedJobDescriptorDrainExtension` (every new job on the
+- Three extensions on `QueuedJobDescriptor`: `QueuedJobDescriptorDrainExtension` (every new job on the
   `IMMEDIATE` queue starts a background drain, see [§2](#2-immediate-job-execution); switch it off
-  with `DrainSpawner.enabled: false`) and `QueuedJobContextExtension` (records the running job in
-  `$_SERVER` for error reports, see [§9](#9-job-context-for-error-reports)).
+  with `DrainSpawner.enabled: false`), `QueuedJobContextExtension` (records the running job in
+  `$_SERVER` for error reports, see [§9](#9-job-context-for-error-reports)) and
+  `QueuedJobDescriptorPermissionExtension` (`canView()` for the member a job runs as, see
+  [§1](#1-job-progress-tracking)).
 
 <!-- It registers no extensions and adds no runtime hooks — nothing runs unless you call it. -->
 <!-- Apart from the drain spawn it adds no runtime hooks: nothing else runs unless you call it. -->
-Apart from these two descriptor hooks it adds no runtime hooks: nothing else runs unless you call it.
+<!-- Apart from these two descriptor hooks it adds no runtime hooks: nothing else runs unless you call it. -->
+Apart from the two descriptor write hooks it adds no runtime hooks: nothing else runs unless you call it.
 
 ## Features
 
@@ -81,7 +84,17 @@ Returns JSON:
 
 `progress`/`total` come from the descriptor's `StepsProcessed`/`TotalSteps`; `percent` is derived (0 when total is 0). `message` is the last job message as plain text (HTML stripped). `complete` is `true` once the job reaches a terminal status (`Complete`, `Broken`, or `Cancelled`), at which point `finished` is populated from `JobFinished`.
 
-**Authentication and permission:** the caller must be logged in (otherwise `401`). Access is granted if `$descriptor->canView($member)` returns true, or — as a fallback — if the member's ID matches the descriptor's `RunAsID` (so the user who queued a job can always watch it). Missing ID → `400`; unknown descriptor → `404`; not permitted → `403`. Responses are sent with `Cache-Control: no-store` so progress is never cached.
+<!-- **Authentication and permission:** the caller must be logged in (otherwise `401`). Access is granted if `$descriptor->canView($member)` returns true, or — as a fallback — if the member's ID matches the descriptor's `RunAsID` (so the user who queued a job can always watch it). Missing ID → `400`; unknown descriptor → `404`; not permitted → `403`. Responses are sent with `Cache-Control: no-store` so progress is never cached. -->
+**Authentication and permission:** the caller must be logged in (otherwise `401`). Access is
+`$descriptor->canView($member)`: upstream allows ADMIN, and the module's
+`QueuedJobDescriptorPermissionExtension` adds the member whose ID is the descriptor's `RunAsID` (so
+the user who queued a job can always watch it). The rule lives on the model, not in the
+controller, so every caller of `canView()` gets the same answer; it only ever adds a `true` for that
+member, so a `false` from another extension still wins. Missing ID → `400`; unknown descriptor, or
+one the member may not view → `404` (the same response, so IDs cannot be probed; up to 1.7.0 the
+latter was a `403`). For a `Broken` job a non-admin gets `"message": "Job failed"` instead of the
+last message, which is often the exception text that broke the job; ADMIN gets the real message.
+Responses are sent with `Cache-Control: no-store` so progress is never cached.
 
 **Declarative use (auto-discovered):**
 

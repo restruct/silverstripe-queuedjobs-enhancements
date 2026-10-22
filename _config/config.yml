@@ -37,6 +37,9 @@ Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor:
     # EnhancedErrorFormatter (they are in its default `server_vars`). Moved here from admintweaks
     # in 1.7.0; admintweaks no longer registers its own copy when this class exists.
     - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobContextExtension
+    # canView() for the member the job runs as (RunAsID), on top of upstream's ADMIN-only default.
+    # Used by JobProgressController; structural, so any other caller of canView() agrees with it.
+    - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobDescriptorPermissionExtension
 
 # Self-declaring default jobs ($is_default_job = true) are DIAGNOSTIC ONLY — this module
 # does not create or schedule them. Core already does that: QueuedJobService::runQueue()
