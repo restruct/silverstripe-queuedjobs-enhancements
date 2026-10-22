@@ -43,14 +43,17 @@ The module registers:
 - The drain runner: `sake queuedjobs:work` on Silverstripe 6, `dev/tasks/QueuedJobsWorkTask` on
   Silverstripe 5 (see [§8](#8-drain-runner-queuedjobswork)). It adds no tables.
 - Exposes `client/` (for `client/js/job-progress.js`) via `extra.expose` in `composer.json`.
-- Two extensions on `QueuedJobDescriptor`: `QueuedJobDescriptorDrainExtension` (every new job on the
+- Three extensions on `QueuedJobDescriptor`: `QueuedJobDescriptorDrainExtension` (every new job on the
   `IMMEDIATE` queue starts a background drain, see [§2](#2-immediate-job-execution); switch it off
-  with `DrainSpawner.enabled: false`) and `QueuedJobContextExtension` (records the running job in
-  `$_SERVER` for error reports, see [§9](#9-job-context-for-error-reports)).
+  with `DrainSpawner.enabled: false`), `QueuedJobContextExtension` (records the running job in
+  `$_SERVER` for error reports, see [§9](#9-job-context-for-error-reports)) and
+  `QueuedJobDescriptorPermissionExtension` (`canView()` for the member a job runs as, see
+  [§1](#1-job-progress-tracking)).
 
 <!-- It registers no extensions and adds no runtime hooks — nothing runs unless you call it. -->
 <!-- Apart from the drain spawn it adds no runtime hooks: nothing else runs unless you call it. -->
-Apart from these two descriptor hooks it adds no runtime hooks: nothing else runs unless you call it.
+<!-- Apart from these two descriptor hooks it adds no runtime hooks: nothing else runs unless you call it. -->
+Apart from the two descriptor write hooks it adds no runtime hooks: nothing else runs unless you call it.
 
 ## Features
 
@@ -81,7 +84,17 @@ Returns JSON:
 
 `progress`/`total` come from the descriptor's `StepsProcessed`/`TotalSteps`; `percent` is derived (0 when total is 0). `message` is the last job message as plain text (HTML stripped). `complete` is `true` once the job reaches a terminal status (`Complete`, `Broken`, or `Cancelled`), at which point `finished` is populated from `JobFinished`.
 
-**Authentication and permission:** the caller must be logged in (otherwise `401`). Access is granted if `$descriptor->canView($member)` returns true, or — as a fallback — if the member's ID matches the descriptor's `RunAsID` (so the user who queued a job can always watch it). Missing ID → `400`; unknown descriptor → `404`; not permitted → `403`. Responses are sent with `Cache-Control: no-store` so progress is never cached.
+<!-- **Authentication and permission:** the caller must be logged in (otherwise `401`). Access is granted if `$descriptor->canView($member)` returns true, or — as a fallback — if the member's ID matches the descriptor's `RunAsID` (so the user who queued a job can always watch it). Missing ID → `400`; unknown descriptor → `404`; not permitted → `403`. Responses are sent with `Cache-Control: no-store` so progress is never cached. -->
+**Authentication and permission:** the caller must be logged in (otherwise `401`). Access is
+`$descriptor->canView($member)`: upstream allows ADMIN, and the module's
+`QueuedJobDescriptorPermissionExtension` adds the member whose ID is the descriptor's `RunAsID` (so
+the user who queued a job can always watch it). The rule lives on the model, not in the
+controller, so every caller of `canView()` gets the same answer; it only ever adds a `true` for that
+member, so a `false` from another extension still wins. Missing ID → `400`; unknown descriptor, or
+one the member may not view → `404` (the same response, so IDs cannot be probed; up to 1.7.0 the
+latter was a `403`). For a `Broken` job a non-admin gets `"message": "Job failed"` instead of the
+last message, which is often the exception text that broke the job; ADMIN gets the real message.
+Responses are sent with `Cache-Control: no-store` so progress is never cached.
 
 **Declarative use (auto-discovered):**
 
@@ -158,6 +171,14 @@ the marker is touched, so a job queued after the runner's last look at the queue
 marker behind for the wrapper to see. During a burst only the first dispatch starts PHP; the
 others cost a short-lived `bash` and lock attempt.
 
+The loop is bounded, so a broken environment cannot make it start PHP for ever: a marker that
+cannot be removed (folder not writable, read-only filesystem) stops the wrapper before the runner
+starts; a runner or lock tool that fails (e.g. a lock file that cannot be opened) gets one more
+pass for a job queued meanwhile, and a second failure stops it; every pass after the first waits
+0.2 s; and a wrapper runs at most `QJE_DRAIN_MAX_PASSES` runners (default 50), after which it
+leaves the marker for the next dispatch or the cron. Each of these stops exits `70` with the
+reason on stderr (see `DrainSpawner.log_file` below to keep it).
+
 The runner lingers before it exits: once the queue is empty it keeps looking for a new due job
 every 0.5 s for `QueueWorker.linger` seconds (default 2), so a trickle of dispatches is served by
 one process instead of a boot per job.
@@ -207,6 +228,23 @@ upstream's default; the drain does not depend on it, and the runner switches it 
 process. Where it is false, upstream writes a `queuedjob-<ID>` trigger file per immediate job and
 only deletes it when the job completes; the runner deletes the file of every job it ran, whatever
 the outcome (§8), so broken or parked jobs leave none behind.
+
+**On a server shared with other accounts**, keep both paths out of reach of the others:
+
+- Set `QueuedJobService.cache_dir` to an absolute folder inside the site's own tree, not the
+  relative default under `TEMP_PATH`. `TEMP_PATH` sits under the system temp folder (`/tmp`)
+  unless `SS_TEMP_PATH` or a project `silverstripe-cache/` says otherwise, and Silverstripe makes
+  its parent folder world-writable. Another account that can write there can pre-create or swap
+  the job folder, and so the marker and lock the drain wrapper trusts.
+- Point `DrainSpawner.log_file` (when used) at a folder only the site's account can read: it
+  receives the runners' output, which can include job messages and error text.
+
+```yaml
+Symbiote\QueuedJobs\Services\QueuedJobService:
+  cache_dir: '/home/site/private/queuedjobs'   # absolute, inside the site's own tree
+Restruct\QueuedJobsEnhancements\Services\DrainSpawner:
+  log_file: '/home/site/private/logs/qje-drain.log'
+```
 
 **Transactions.** A job queued inside an open database transaction is invisible to the runner
 until the commit. The drain then runs twice: at once (which covers a commit within the linger) and
@@ -310,6 +348,19 @@ ScheduledMethodCall::schedule($myObject, 'archive', [], [], '+1 hour');
 ```
 
 For instance calls, the running job instance is exposed to the target object as `$object->scheduled_job_instance`, so the called method can add job messages, advance steps, etc. If the method throws, the job is marked `Broken` with the exception detail added as a message.
+
+**Not in the Jobs admin's "Create job of type" form.** That upstream form passes its textarea's
+lines to the job's constructor, which for this job is (class, method): a way to call any static
+method. Since 1.7.1 `QueuedJobsAdminJobTypesExtension` removes `ScheduledMethodCall` (and its
+subclasses) from the dropdown, which also makes the form refuse a crafted POST naming it (the
+dropdown is validated against its options). Queuing it from code is unaffected. Further classes
+can be hidden the same way:
+
+```yaml
+Restruct\QueuedJobsEnhancements\Extensions\QueuedJobsAdminJobTypesExtension:
+  hidden_job_types:
+    - App\Jobs\MyGenericJob
+```
 
 > **For Emails, use [SendEmailJob](#5-sendemailjob) — ScheduledMethodCall cannot carry them.** An `Email` is not a `DataObject`: this job persists class+ID and re-fetches, so a composed Email cannot ride along (the naive attempt ends up calling `Email::send()` statically on an empty singleton).
 
@@ -518,7 +569,9 @@ default `server_vars`); any other error reporter can read them from `$_SERVER`.
 Runs a job's `setup()` + `process()` loop in-process and prints, per `process()` call, memory
 (+ delta), peak, the real `currentStep`, the serialised `jobData` size and the message count, then
 a summary. It answers "does this job accumulate, and where?". **Dev-only**: it really runs the job,
-so it writes whatever the job writes; outside `dev` it refuses.
+so it writes whatever the job writes; outside `dev` it refuses. Over HTTP it also needs ADMIN
+(since 1.7.1): in `dev` mode the task runner is open to any visitor, so the CLI or an administrator
+only.
 
 ```bash
 # Silverstripe 6 (options; the same spelling works in the browser task runner)
@@ -636,11 +689,13 @@ be present, so not a dist install):
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
 # Silverstripe 6 (PHPUnit 11): the flush is an environment variable
 SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
-# expected: OK (107 tests, 319 assertions) on SS5, OK (107 tests, 324 assertions) on SS6
+# expected: OK (122 tests, 359 assertions) on SS5, OK (122 tests, 365 assertions) on SS6
 # (the profiler task's exit codes exist, and are asserted, on SS6 only)
 
-# The drain wrapper, no PHP or database needed (every lock tool available here); --mutants checks
-# that four broken copies of the wrapper each fail it
+# The drain wrapper, no PHP or database needed (every lock tool available here): the marker and
+# exit-75 loops, the busy-lock exit, and the bounds (undeletable marker, unopenable lock, a runner
+# that keeps failing, QJE_DRAIN_MAX_PASSES); --mutants checks that seven broken copies of the
+# wrapper each fail it
 bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-test.sh
 bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-test.sh --mutants
 ```
@@ -648,7 +703,7 @@ bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-
 CI (`.github/workflows/ci.yml`) runs the suite on Silverstripe 5 (PHP 8.1 and 8.3) and
 Silverstripe 6 (PHP 8.3), then boots each host, builds the database and runs both dev tasks.
 
-The suite covers the controller (auth/permission/response shape), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask`, `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
+The suite covers the controller (auth/permission/response shape, `404` for a job the member may not view, the generic message of a `Broken` job for non-admins), the RunAs `canView()` extension, the Jobs admin create-job form (`ScheduledMethodCall` not offered, a crafted POST refused), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask` and `CheckDefaultJobsTask` (output HTML-escaped in the browser), `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal, the CLI-or-ADMIN refusal over HTTP, escaped browser output), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 
 > **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` — the tests follow this convention deliberately.
 
@@ -681,7 +736,7 @@ admintweaks both extensions run; they write the same keys with the same values, 
 
 This module was designed and evaluated in a longer research document before implementation. It realizes **Phases 1, 2 and 5** of that research (progress tracking, immediate execution, self-declaring default jobs, and the admintweaks consolidation). The design rationale, alternatives that were considered and rejected (WebSockets/SSE, FPM shutdown tricks, replacing core classes), and the SS5→SS6 closure-library migration notes are distilled in [docs/RESEARCH.md](docs/RESEARCH.md).
 
-The full original evaluation is archived in the Restruct SSKB at `silverstripe/ideas/queuedjobs-enhancements.md`. That path is a pointer only — this module does not depend on it, and [docs/RESEARCH.md](docs/RESEARCH.md) is self-contained.
+The full original evaluation is kept in internal research notes. This module does not depend on them, and [docs/RESEARCH.md](docs/RESEARCH.md) is self-contained.
 
 ## Roadmap
 

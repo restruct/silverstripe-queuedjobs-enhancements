@@ -2,6 +2,7 @@
 
 namespace Restruct\QueuedJobsEnhancements\Tasks;
 
+use SilverStripe\Core\Convert;
 use SilverStripe\PolyExecution\PolyOutput;
 use Symfony\Component\Console\Formatter\OutputFormatter;
 use Symfony\Component\Console\Input\InputInterface;
@@ -51,9 +52,15 @@ if (class_exists(PolyOutput::class)) {
         protected function execute(InputInterface $input, PolyOutput $output): int
         {
             # Writing through PolyOutput rather than echo/printf, so the browser task runner renders
-            # this the same way the CLI does. Plain lines are written RAW: class names and job phases
-            # are free text and must not be read as console tags; errors get the error style, with
-            # their text escaped for the same reason.
+            # this the same way the CLI does. Class names and job phases are free text: escaped as
+            # console tags and written NORMAL, so the CLI prints them literally and the browser
+            # runner's HTML formatter HTML-escapes them; errors get the error style on top.
+            // old: plain lines were written RAW, which also skips the HTML formatter, so a job
+            // phase carrying markup reached the browser as markup
+            // # Writing through PolyOutput rather than echo/printf, so the browser task runner renders
+            // # this the same way the CLI does. Plain lines are written RAW: class names and job phases
+            // # are free text and must not be read as console tags; errors get the error style, with
+            // # their text escaped for the same reason.
             return $this->profile(
                 (string) $input->getOption('class'),
                 (int) $input->getOption('maxcalls'),
@@ -62,7 +69,8 @@ if (class_exists(PolyOutput::class)) {
                         $output->writeln('<error>' . OutputFormatter::escape($line) . '</>');
                         return;
                     }
-                    $output->writeln($line, PolyOutput::OUTPUT_RAW);
+                    // $output->writeln($line, PolyOutput::OUTPUT_RAW);
+                    $output->writeln(OutputFormatter::escape($line));
                 }
             );
         }
@@ -94,12 +102,17 @@ if (class_exists(PolyOutput::class)) {
          */
         public function run($request)
         {
+            $html = !$this->isCli();
             $this->profile(
                 $request ? (string) $request->getVar('class') : '',
                 $request ? (int) $request->getVar('maxcalls') : 0,
-                function (string $line, bool $isError = false): void {
+                function (string $line, bool $isError = false) use ($html): void {
                     # Plain text, as the task printed before the move (no HTML in the browser either)
-                    echo $line . PHP_EOL;
+                    # but HTML-escaped in the browser: lines carry the request's `class` parameter
+                    # and job phases, and the task runner's page is HTML
+                    // old: echoed as is, so ?class=<script>... was reflected into the page
+                    // echo $line . PHP_EOL;
+                    echo ($html ? Convert::raw2xml($line) : $line) . PHP_EOL;
                 }
             );
         }

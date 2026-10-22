@@ -16,8 +16,9 @@ use Symfony\Component\Console\Input\InputOption;
 # Silverstripe 5 has no PolyCommand. The config system class_exists()es EVERY class in the manifest
 # on a flush (PrivateStaticTransformer) and that autoloads this file, so without this guard the
 # missing parent class fatals the whole SS5 application on flush/dev/build. The YAML `Only:
-# classexists` in _config/worker.yml does not prevent that (SSKB local-module-dev.md, "A class
-# extending an OPTIONAL dependency fatals the WHOLE application at bootstrap").
+# classexists` in _config/worker.yml does not prevent that: YAML conditions decide which config
+# applies, not which classes get loaded, so a class extending an OPTIONAL dependency fatals the
+# WHOLE application at bootstrap unless its file guards itself.
 if (!class_exists(PolyCommand::class)) {
     return;
 }

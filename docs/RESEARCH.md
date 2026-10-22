@@ -6,17 +6,17 @@ This document distills the design thinking behind `restruct/silverstripe-queuedj
 
 The design was driven by these local documents. **This module does not depend on any of them** — everything needed is captured in this file and `README.md`. Verified inventory (2026-07-02):
 
-**Primary research (Restruct SSKB)**
-- `silverstripe/ideas/queuedjobs-enhancements.md` (~64 KB) — the research doc: problem statement, six proposed "pillars", prior-art survey, a Laravel-feature comparison, and full code sketches + the phased scope (Phases 1/2/5) the module was built from.
-- `silverstripe/topics/queuedjobs.md` (~63 KB) — the SSKB QueuedJobs reference (job lifecycle, config, patterns; the `ss-queuedjobs` agent knowledge base). Source for the shutdown-function / IMMEDIATE-queue analysis in this doc.
+**Primary research (internal research notes, not published)**
+- The original evaluation (~64 KB): problem statement, six proposed "pillars", prior-art survey, a Laravel-feature comparison, and full code sketches + the phased scope (Phases 1/2/5) the module was built from.
+- An internal QueuedJobs reference (~63 KB): job lifecycle, config, patterns. Source for the shutdown-function / IMMEDIATE-queue analysis in this doc, which can be checked against upstream's `QueuedJobService::__construct()` (registers `onShutdown()`) and `onShutdown()` (runs `processJobQueue(QueuedJob::IMMEDIATE)`).
 
 **Plans**
 - The implementation plans were internal working documents and are not part of the published repository.
 
-**SSKB profiles that governed the workflow**
-- `silverstripe/profiles/local-module-dev.md` — the `_dev/` path-repository workflow (the fix for the double-scan bug below).
-- `silverstripe/profiles/composer.md` — path repos + version constraints (`dev-ss5-update`).
-- `silverstripe/profiles/cli-commands.md` — when to flush vs. dev/build; `cli-script.php` over `sake` on SS5 (`DrainSpawner` runs the task through `cli-script.php` on SS5 and through `bin/sake` on SS6).
+**Internal development guidelines that governed the workflow**
+- Local module development: the `_dev/` path-repository workflow (the fix for the double-scan bug below).
+- Composer: path repos + version constraints (`dev-ss5-update`).
+- CLI commands: when to flush vs. dev/build; `cli-script.php` over `sake` on SS5 (`DrainSpawner` runs the task through `cli-script.php` on SS5 and through `bin/sake` on SS6).
 
 **Consolidation origins (code moved into this module)**
 - `restruct/silverstripe-admintweaks: src/Jobs/ScheduledMethodCall.php` — origin of this module's `ScheduledMethodCall` (present in the working admintweaks copy).
@@ -212,7 +212,7 @@ As of writing, one site still imports the admintweaks versions — it installs t
 
 Recorded here because it will bite anyone who relocates the module during local development:
 
-The module must live under a directory that Silverstripe's `ModuleManifest` does **not** scan directly while it is *also* installed via the vendor symlink. Originally the module was placed at the project root (`/a-queuedjobs-enhancements/`); because that directory contained a `_config/` folder, the manifest scanned it **both** directly and again through the `vendor/` symlink, producing "two files containing the same class" errors on every `flush`. Moving it under `_dev/` (which SS does not scan) resolved this — the standard SSKB local-module workflow. If you see duplicate-class errors on flush, check for exactly this double-scan.
+The module must live under a directory that Silverstripe's `ModuleManifest` does **not** scan directly while it is *also* installed via the vendor symlink. Originally the module was placed at the project root (`/a-queuedjobs-enhancements/`); because that directory contained a `_config/` folder, the manifest scanned it **both** directly and again through the `vendor/` symlink, producing "two files containing the same class" errors on every `flush`. Moving it under `_dev/` (which SS does not scan) resolved this: the usual local module-development layout. If you see duplicate-class errors on flush, check for exactly this double-scan.
 
 ## Rejected / out-of-scope (recap)
 
@@ -222,8 +222,7 @@ The module must live under a directory that Silverstripe's `ModuleManifest` does
 - **A resident worker or watcher for the immediate queue**: a process and (for the worker) a DB poll on every site around the clock, plus a deploy restart; the drain spawn instead (§2). A resident worker remains the only way to run exact-second jobs, a possible later opt-in.
 - **`ThrottledQueuedJobService`** — redundant with the core `NotifiedBroken` flag.
 
-## Related SSKB resources (for those with access)
+## Related upstream sources
 
-- `silverstripe/topics/queuedjobs.md` — comprehensive QueuedJobs reference (see the "Immediate jobs" section for the shutdown-function analysis).
-- `silverstripe/topics/health-monitoring.md` — queue health checks.
-- `silverstripe/ideas/queuedjobs-enhancements.md` — the full original evaluation (source for this distillation).
+- `symbiote/silverstripe-queuedjobs` `src/Services/QueuedJobService.php`: `__construct()` and `onShutdown()` for the shutdown-function drain of the IMMEDIATE queue; `checkJobHealth()` and `checkDefaultJobs()` for queue health checks and default jobs.
+- The full original evaluation this document distills is kept in internal research notes; this file is self-contained without it.

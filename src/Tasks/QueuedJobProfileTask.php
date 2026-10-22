@@ -6,6 +6,7 @@ use ReflectionProperty;
 use SilverStripe\Control\Director;
 use SilverStripe\Core\ClassInfo;
 use SilverStripe\Dev\BuildTask;
+use SilverStripe\Security\Permission;
 use Symbiote\QueuedJobs\Services\AbstractQueuedJob;
 
 /**
@@ -42,7 +43,9 @@ use Symbiote\QueuedJobs\Services\AbstractQueuedJob;
  * job-specific state lives in jobData behind the magic __get. Mixing the two up silently reads 0 and
  * makes a leaking job look flat — which is exactly the false negative this task exists to prevent.
  *
- * Dev-only: it EXECUTES the job, so it writes whatever the job writes.
+ * Dev-only: it EXECUTES the job, so it writes whatever the job writes. And CLI or ADMIN only: in
+ * dev mode the task runner (dev/tasks) is open to anyone over HTTP, logged in or not, and this
+ * task would run any job class with its default constructor for them.
  *
  * Moved here from restruct/silverstripe-admintweaks (Restruct\Silverstripe\AdminTweaks\Dev\
  * QueuedJobProfileTask) in 1.7.0, under the same name; admintweaks disables its own copy when this
@@ -100,6 +103,13 @@ class QueuedJobProfileTask extends BuildTask
     {
         if (!Director::isDev()) {
             $write('Dev-only: this task actually RUNS the job (and writes whatever the job writes).', true);
+
+            return static::RESULT_FAILURE;
+        }
+
+        # isDev() alone is not enough: in dev mode dev/tasks lets any visitor run a task over HTTP
+        if (!$this->isCli() && !Permission::check('ADMIN')) {
+            $write('Run this task from the CLI, or log in as an administrator: it actually RUNS the job.', true);
 
             return static::RESULT_FAILURE;
         }
@@ -171,6 +181,15 @@ class QueuedJobProfileTask extends BuildTask
         ));
 
         return static::RESULT_SUCCESS;
+    }
+
+    /**
+     * Whether the task runs on the command line. A method so that a test can pretend to be an HTTP
+     * request: Director::is_cli() asks the SAPI, which is always the CLI under PHPUnit.
+     */
+    protected function isCli(): bool
+    {
+        return Director::is_cli();
     }
 
     /**

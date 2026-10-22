@@ -9,7 +9,11 @@
 # fallback): one run and exit 0 when nothing is left; the marker is removed inside the lock; a
 # marker touched during a run makes it run again; exit 75 makes it run again; another exit code
 # does not; a held lock makes a second wrapper exit at once without touching the marker, and the
-# holder then runs again for it; runner arguments with spaces arrive intact.
+# holder then runs again for it; runner arguments with spaces arrive intact. And the bounds, each
+# run with a time limit so that an endless wrapper fails instead of hanging the suite: a marker
+# that cannot be removed stops it before the runner starts; a lock file that cannot be opened
+# stops it; a runner that fails while jobs keep arriving runs twice, not for ever; and
+# QJE_DRAIN_MAX_PASSES caps the runs of a runner that keeps exiting 75.
 # QJE_DRAIN_SCRIPT points the tests at another copy of the wrapper (used by --mutants).
 # Compatible with bash 3.2+ (macOS) and 5.
 
@@ -22,6 +26,8 @@ BG_PIDS=""
 
 cleanup() {
     for pid in $BG_PIDS; do kill "$pid" 2>/dev/null; done
+    # the read-only marker folder of the bounds checks would otherwise survive the rm
+    chmod -R u+w "$TMP" 2>/dev/null
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -63,6 +69,23 @@ starts() { grep -c '^start ' "$TMP/runs.log"; }
 # drain [extra runner args...]: run the wrapper in the foreground with the current lock tool
 drain() {
     QJE_DRAIN_LOCK_TOOL=$TOOL bash "$DRAIN" "$TMP/marker" "$TMP/lock" "$TMP/runner.sh" "$TMP" "$@" 2> "$TMP/stderr"
+}
+
+# drain_bounded SECS MARKER LOCK [extra runner args...]: run the wrapper in the background with
+# the current lock tool and give it SECS seconds. Sets rc (the wrapper's exit code) and timed_out
+# (yes when it had to be killed: an unbounded loop). No timeout(1): macOS does not ship it.
+drain_bounded() {
+    secs=$1; marker=$2; lock=$3; shift 3
+    QJE_DRAIN_LOCK_TOOL=$TOOL bash "$DRAIN" "$marker" "$lock" "$TMP/runner.sh" "$TMP" "$@" 2> "$TMP/stderr" &
+    bpid=$!; BG_PIDS="$BG_PIDS $bpid"
+    i=0; while kill -0 "$bpid" 2>/dev/null && [ $i -lt $((secs * 10)) ]; do sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$bpid" 2>/dev/null; then
+        kill "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        timed_out=yes; rc=-1
+    else
+        wait "$bpid"; rc=$?
+        timed_out=no
+    fi
 }
 
 run_suite() {
@@ -148,6 +171,61 @@ run_suite() {
     else
         [ ! -s "$TMP/stderr" ] && pass "[$TOOL] no warning" || { fail "[$TOOL] no warning"; cat "$TMP/stderr"; }
     fi
+
+    # 8. The marker cannot be removed (its folder is not writable): the wrapper stops at once,
+    #    with a message and exit 70, and never starts the runner. Before 1.7.1 the rm failure was
+    #    ignored and the marker, still there after every run, started a runner for ever. Skipped
+    #    as root, where a read-only folder does not stop the rm.
+    if [ "$(id -u)" -ne 0 ]; then
+        reset_state
+        mkdir -p "$TMP/ro"; chmod u+w "$TMP/ro"; touch "$TMP/ro/marker"; chmod a-w "$TMP/ro"
+        drain_bounded 5 "$TMP/ro/marker" "$TMP/lock"
+        chmod u+w "$TMP/ro"
+        if [ "$timed_out" = no ] && [ "$rc" -eq 70 ] && [ "$(starts)" -eq 0 ] && grep -q 'cannot remove marker' "$TMP/stderr"; then
+            pass "[$TOOL] undeletable marker: stops at once, runner not started, exit 70"
+        else
+            fail "[$TOOL] undeletable marker: bounded (timed_out=$timed_out, rc=$rc, runs=$(starts))"; tail -n 5 "$TMP/stderr"
+        fi
+        rm -rf "$TMP/ro"
+    else
+        echo "# running as root: the undeletable-marker check is skipped"
+    fi
+
+    # 9. The lock file cannot be opened (its folder does not exist), with a marker pending: the
+    #    lock tool fails, so the runner never starts and the marker stays. The wrapper tries once
+    #    more and stops with exit 70, instead of hot-spinning on the marker. Not for "none", which
+    #    takes no lock and simply runs.
+    if [ "$TOOL" != none ]; then
+        reset_state
+        touch "$TMP/marker"
+        drain_bounded 5 "$TMP/marker" "$TMP/no-such-dir/lock"
+        if [ "$timed_out" = no ] && [ "$rc" -eq 70 ] && [ "$(starts)" -eq 0 ] && grep -q 'failed twice' "$TMP/stderr"; then
+            pass "[$TOOL] unopenable lock: two attempts, then exit 70"
+        else
+            fail "[$TOOL] unopenable lock: bounded (timed_out=$timed_out, rc=$rc, runs=$(starts))"; tail -n 5 "$TMP/stderr"
+        fi
+    fi
+
+    # 10. A runner that fails while jobs keep arriving (the marker touched during every run): one
+    #     rerun for the marker, then the second failure stops it with exit 70
+    reset_state
+    i=0; while [ $i -lt 20 ]; do echo '1 0 touch'; i=$((i + 1)); done > "$TMP/script"
+    drain_bounded 10 "$TMP/marker" "$TMP/lock"
+    if [ "$timed_out" = no ] && [ "$rc" -eq 70 ] && [ "$(starts)" -eq 2 ]; then
+        pass "[$TOOL] failing runner with jobs arriving: two runs, then exit 70"
+    else
+        fail "[$TOOL] failing runner with jobs arriving: two runs (timed_out=$timed_out, rc=$rc, runs=$(starts))"; cat "$TMP/stderr"
+    fi
+
+    # 11. QJE_DRAIN_MAX_PASSES caps the runs of a runner that keeps exiting 75
+    reset_state
+    i=0; while [ $i -lt 20 ]; do echo '75'; i=$((i + 1)); done > "$TMP/script"
+    QJE_DRAIN_MAX_PASSES=4 drain_bounded 10 "$TMP/marker" "$TMP/lock"
+    if [ "$timed_out" = no ] && [ "$rc" -eq 70 ] && [ "$(starts)" -eq 4 ] && grep -q 'stopping after 4 runs' "$TMP/stderr"; then
+        pass "[$TOOL] QJE_DRAIN_MAX_PASSES=4: four runs, then exit 70"
+    else
+        fail "[$TOOL] QJE_DRAIN_MAX_PASSES=4: four runs (timed_out=$timed_out, rc=$rc, runs=$(starts))"; cat "$TMP/stderr"
+    fi
 }
 
 # Must-fail controls: each mutant breaks one rule of the wrapper; the suite must fail against
@@ -155,7 +233,7 @@ run_suite() {
 if [ "${1:-}" = --mutants ]; then
     SRC="$HERE/../../bin/qje-drain.sh"
     survived=0
-    for mutant in no-marker-loop no-75-loop no-busy-exit rm-outside-lock; do
+    for mutant in no-marker-loop no-75-loop no-busy-exit rm-outside-lock rm-unchecked no-failure-limit no-pass-cap; do
         M="$TMP/drain-$mutant.sh"
         case $mutant in
             # the marker check after the runner never fires
@@ -168,6 +246,12 @@ if [ "${1:-}" = --mutants ]; then
             # the marker is removed before the lock is taken: a wrapper that then finds the lock
             # held has eaten the marker, and the holder never runs again for it
             rm-outside-lock) sed 's/^    run_locked "\$@"$/    rm -f "$MARKER"; run_locked "$@"/' "$SRC" > "$M" ;;
+            # the marker's rm failure is ignored again (the 1.7.0 inner command)
+            rm-unchecked) sed 's/^INNER=.*/INNER='"'"'rm -f "$1"; shift; exec "$@"'"'"'/' "$SRC" > "$M" ;;
+            # a failing runner never stops the wrapper
+            no-failure-limit) sed 's/if \[ "\$failures" -ge 2 \]; then/if false; then/' "$SRC" > "$M" ;;
+            # no cap on the number of runs
+            no-pass-cap) sed 's/if \[ "\$passes" -ge "\$MAX_PASSES" \]; then/if false; then/' "$SRC" > "$M" ;;
         esac
         if cmp -s "$SRC" "$M"; then
             echo "FAIL - mutant $mutant: the sed did not change the wrapper (the control is broken)"; survived=1; continue

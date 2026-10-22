@@ -2,8 +2,11 @@
 
 namespace Restruct\QueuedJobsEnhancements\Tasks;
 
+use SilverStripe\Control\Director;
+use SilverStripe\Core\Convert;
 use SilverStripe\PolyExecution\PolyOutput;
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Formatter\OutputFormatter;
 use Symfony\Component\Console\Input\InputInterface;
 
 /*
@@ -25,7 +28,8 @@ use Symfony\Component\Console\Input\InputInterface;
  * pattern as restruct/silverstripe-signed-asset-urls' SignedAssetUrlVerifyTaskEntryPoint.
  *
  * PolyOutput exists only on Silverstripe 6 (framework 6 `src/PolyExecution/`), so its presence is
- * the version switch. The `use` imports above are inert on SS5: an import never autoloads.
+ * the version switch. The `use` imports above are inert on the major that does not use them: an
+ * import never autoloads.
  */
 if (class_exists(PolyOutput::class)) {
     /**
@@ -44,8 +48,14 @@ if (class_exists(PolyOutput::class)) {
         protected function execute(InputInterface $input, PolyOutput $output): int
         {
             $this->cleanup(function (string $message) use ($output): void {
-                # OUTPUT_RAW: job titles are free text and must not be read as console tags
-                $output->writeln($message, PolyOutput::OUTPUT_RAW);
+                # Job titles are free text. Escaped as console tags and written NORMAL, so the
+                # formatter prints them literally on the CLI, and in the browser task runner its
+                # HTML formatter (FORMAT_HTML, decorated) HTML-escapes them.
+                // old: OUTPUT_RAW kept console tags out, but it also skips the HTML formatter, so
+                // a title like <script> reached the browser task runner as markup (stored XSS)
+                // # OUTPUT_RAW: job titles are free text and must not be read as console tags
+                // $output->writeln($message, PolyOutput::OUTPUT_RAW);
+                $output->writeln(OutputFormatter::escape($message));
             });
 
             return Command::SUCCESS;
@@ -73,9 +83,23 @@ if (class_exists(PolyOutput::class)) {
          */
         public function run($request)
         {
-            $this->cleanup(function (string $message): void {
-                $this->output($message);
+            $html = $this->writesHtml();
+            $this->cleanup(function (string $message) use ($html): void {
+                # Job titles are free text: HTML-escaped when the task runs in a browser, where
+                # the task runner's page is HTML; plain on the CLI
+                // old: echoed as is, so a title like <script> ran in the browser (stored XSS)
+                // $this->output($message);
+                $this->output($html ? Convert::raw2xml($message) : $message);
             });
+        }
+
+        /**
+         * Whether the output is a browser page (dev/tasks over HTTP) rather than a terminal. A
+         * method so that a test can pretend to be a browser: Director::is_cli() asks the SAPI.
+         */
+        protected function writesHtml(): bool
+        {
+            return !Director::is_cli();
         }
     }
 }

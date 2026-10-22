@@ -354,7 +354,8 @@ class DrainSpawner
 
     /**
      * Whether a transaction is open on the connection the descriptor was written to. Silverstripe 6
-     * with replicas: the primary, where writes go (SSKB orm transactions note); SS5 has one.
+     * with replicas: the primary, where writes go (framework 6 `ORM/DB.php`: DB::CONN_PRIMARY,
+     * DB::withPrimary()); SS5 has one.
      */
     protected function inTransaction(): bool
     {

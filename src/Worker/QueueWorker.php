@@ -391,7 +391,8 @@ class QueueWorker
      *
      * QueuedJobService's constructor registers onShutdown() on every CLI process while
      * use_shutdown_function is true (the default), and onShutdown() runs processJobQueue(IMMEDIATE):
-     * every pending immediate job, not only ours (SSKB queuedjobs §12). For the `--job=N` mode of
+     * every pending immediate job, not only ours (upstream QueuedJobService::__construct() and
+     * onShutdown()). For the `--job=N` mode of
      * the per-job spawn (removed in 1.7.0) that was "bug 3": a spawn meant for one job ran the whole
      * immediate queue. A worker has no use for the drain, since it processes its queues itself.
      *
