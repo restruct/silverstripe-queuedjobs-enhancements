@@ -332,6 +332,19 @@ ScheduledMethodCall::schedule($myObject, 'archive', [], [], '+1 hour');
 
 For instance calls, the running job instance is exposed to the target object as `$object->scheduled_job_instance`, so the called method can add job messages, advance steps, etc. If the method throws, the job is marked `Broken` with the exception detail added as a message.
 
+**Not in the Jobs admin's "Create job of type" form.** That upstream form passes its textarea's
+lines to the job's constructor, which for this job is (class, method): a way to call any static
+method. Since 1.7.1 `QueuedJobsAdminJobTypesExtension` removes `ScheduledMethodCall` (and its
+subclasses) from the dropdown, which also makes the form refuse a crafted POST naming it (the
+dropdown is validated against its options). Queuing it from code is unaffected. Further classes
+can be hidden the same way:
+
+```yaml
+Restruct\QueuedJobsEnhancements\Extensions\QueuedJobsAdminJobTypesExtension:
+  hidden_job_types:
+    - App\Jobs\MyGenericJob
+```
+
 > **For Emails, use [SendEmailJob](#5-sendemailjob) — ScheduledMethodCall cannot carry them.** An `Email` is not a `DataObject`: this job persists class+ID and re-fetches, so a composed Email cannot ride along (the naive attempt ends up calling `Email::send()` statically on an empty singleton).
 
 **Options (4th argument):**

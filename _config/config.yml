@@ -41,6 +41,14 @@ Symbiote\QueuedJobs\DataObjects\QueuedJobDescriptor:
     # Used by JobProgressController; structural, so any other caller of canView() agrees with it.
     - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobDescriptorPermissionExtension
 
+# Keep ScheduledMethodCall out of upstream's "Create job of type" form in the Jobs admin: its
+# constructor takes (class, method) from that form's textarea, which made it a way to call any
+# static method. Also refuses a crafted POST (the dropdown is validated against its source). More
+# classes: QueuedJobsAdminJobTypesExtension.hidden_job_types.
+Symbiote\QueuedJobs\Controllers\QueuedJobsAdmin:
+  extensions:
+    - Restruct\QueuedJobsEnhancements\Extensions\QueuedJobsAdminJobTypesExtension
+
 # Self-declaring default jobs ($is_default_job = true) are DIAGNOSTIC ONLY — this module
 # does not create or schedule them. Core already does that: QueuedJobService::runQueue()
 # calls checkDefaultJobs() on every ProcessJobQueueTask run. Use
