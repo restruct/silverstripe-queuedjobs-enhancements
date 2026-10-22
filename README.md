@@ -188,6 +188,60 @@ What does **not** trigger a drain: updates of an existing descriptor, jobs on th
 new row). A future `StartAfter` is not checked: the runner's `getNextPendingJob()` skips a job that
 is not due yet, so that drain exits after its linger and the cron picks the job up when it is due.
 
+**One at a time, but not the only runner.** The drain runs immediate jobs one after the other in
+one runner. The `queue=immediate` cron (the safety net, below) is a separate process, though: while
+a drain is busy with a long job, the cron can start the next immediate job beside it. Upstream's
+mutex still stops one job from running twice, but two different immediate jobs can run at the same
+time.
+
+#### Starting a regular job at once (`queueAndStart()`)
+
+A long job (many steps, or one step over a minute) should not go on the immediate queue: its cron
+usually runs every minute, and upstream's health check at the start of every `ProcessJobQueueTask`
+run restarts a `Running` job that made no step since the previous check once its lock has expired.
+That lock (`Expiry`) is set once, when the job starts, to `QueuedJobService.worker_ttl` (5 minutes)
+ahead, and nothing moves it forward while the job runs. So on a one-minute queue, a job running
+longer than 5 minutes with a step longer than a minute is restarted in the middle of that step, and
+two processes then work on the same job. On the regular queue (typically a 10-minute cron) the same
+job is safe.
+
+`queueAndStart()` queues the job on its **own** queue (normally `Queued`) and starts it at once in
+the background, without moving it to the immediate queue:
+
+```php
+use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
+
+$id = ImmediateJobRunner::queueAndStart($job);   // optional 2nd arg: $startAfter
+```
+
+The opt-in is per queued job, not per job class: the same class queued with plain `queueJob()`
+waits for its cron as usual. Only the jobs queued this way are started; every other due job on the
+regular queue keeps waiting for its cron.
+
+How it works: a second lane of the drain spawn. `DrainSpawner::requestStart()` writes a request
+file named after the descriptor ID in `.qje-spawn/start/`, touches `.qje-spawn/start-pending` and
+starts `bin/qje-drain.sh` with its own lock (`.qje-spawn/start-lock`) and the runner in its
+`requested` mode (`queuedjobs:work --requested`, SS5 `requested=1`), which runs only the requested
+descriptors, oldest first. The order (row, request file, marker, spawn) is the same as for a drain,
+so no request is lost. The two lanes have separate locks: a long immediate drain never holds up a
+start, nor the other way around.
+
+- **In series.** Several requests are run one after the other by one runner: a second job queued
+  with `queueAndStart()` while the first one runs starts when the first one is done.
+- **Its own queue's health check.** The started job is an ordinary `Queued` (or `Large`) job; only
+  that queue's cron checks it, exactly as for a job the cron started itself.
+- **Not due yet**: a future `$startAfter` starts nothing; the queue's cron runs the job when it is
+  due.
+- **Already queued**: when `queueJob()` finds a `New` job with the same signature it hands back that
+  descriptor, and its start is requested all the same.
+- **An `IMMEDIATE` job** (its `getJobType()`) is simply drained.
+- **Stale requests** (the job was deleted, already runs elsewhere, finished, or is no longer due)
+  are dropped by the runner. A job parked as `Waiting` keeps its request until it is resumed.
+- **Transactions**: inside an open transaction the request is written, and the runner started, at
+  the end of the process, after the commit.
+- The same switches and guards as the drain: `DrainSpawner.enabled: false`, no `exec()`, a test
+  database. In each case the job simply waits for its cron.
+
 **Requirements**
 
 | | |
@@ -486,6 +540,7 @@ php vendor/silverstripe/framework/cli-script.php dev/tasks/QueuedJobsWorkTask qu
 | `memory` | the `QueuedJobService.memory_limit` | Exit once peak memory reaches this (`512M`, `1G`; a bare number is MB, as in Laravel). |
 | `linger` | `QueueWorker.linger` (2) | Once empty, keep looking for a due job every 0.5 s for this many seconds before exiting. `0` = exit at once. |
 | `stop-when-empty` | | No effect since 1.7.0: stopping when empty is the only behaviour. Still accepted, because `bin/qje-drain.sh` passes it. |
+| `requested` | off | Run only the jobs queued with `queueAndStart()` (the start requests in `.qje-spawn/start/`), whatever their queue, instead of `queue`. SS6 `--requested`, SS5 `requested=1` (a bare flag is not read there). See §2. |
 
 **How it picks jobs.** Each pass calls upstream's own `QueuedJobService::getNextPendingJob()` and
 runs the job through `QueuedJobService::runJob()`: the same selection (`Waiting` jobs first, then
@@ -658,8 +713,8 @@ src/
 │   ├── ConcurrencyGuardedMutex.php     # grabMutex() claim-then-verify override (trait)
 │   ├── DefaultJobManager.php           # Default-job discovery + diagnostics + YAML emitter
 │   ├── EnhancedQueuedJobService.php    # The single opt-in Injector swap target
-│   ├── DrainSpawner.php                # Drain spawn: marker + detached bin/qje-drain.sh
-│   └── ImmediateJobRunner.php          # queueAndRun(), CLI php binary, job folder
+│   ├── DrainSpawner.php                # Drain spawn + start requests: marker + detached bin/qje-drain.sh
+│   └── ImmediateJobRunner.php          # queueAndRun(), queueAndStart(), CLI php binary, job folder
 ├── Tasks/
 │   ├── CheckDefaultJobsTask.php        # Report default jobs / emit defaultJobs YAML
 │   ├── CheckDefaultJobsTaskEntryPoint.php   # run() on SS5 / execute() on SS6
@@ -689,7 +744,7 @@ be present, so not a dist install):
 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests flush=1
 # Silverstripe 6 (PHPUnit 11): the flush is an environment variable
 SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-enhancements/tests
-# expected: OK (122 tests, 359 assertions) on SS5, OK (122 tests, 365 assertions) on SS6
+# expected: OK (143 tests, 455 assertions) on SS5, OK (143 tests, 461 assertions) on SS6
 # (the profiler task's exit codes exist, and are asserted, on SS6 only)
 
 # The drain wrapper, no PHP or database needed (every lock tool available here): the marker and
