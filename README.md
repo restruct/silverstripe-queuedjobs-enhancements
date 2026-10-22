@@ -158,6 +158,14 @@ the marker is touched, so a job queued after the runner's last look at the queue
 marker behind for the wrapper to see. During a burst only the first dispatch starts PHP; the
 others cost a short-lived `bash` and lock attempt.
 
+The loop is bounded, so a broken environment cannot make it start PHP for ever: a marker that
+cannot be removed (folder not writable, read-only filesystem) stops the wrapper before the runner
+starts; a runner or lock tool that fails (e.g. a lock file that cannot be opened) gets one more
+pass for a job queued meanwhile, and a second failure stops it; every pass after the first waits
+0.2 s; and a wrapper runs at most `QJE_DRAIN_MAX_PASSES` runners (default 50), after which it
+leaves the marker for the next dispatch or the cron. Each of these stops exits `70` with the
+reason on stderr (see `DrainSpawner.log_file` below to keep it).
+
 The runner lingers before it exits: once the queue is empty it keeps looking for a new due job
 every 0.5 s for `QueueWorker.linger` seconds (default 2), so a trickle of dispatches is served by
 one process instead of a boot per job.
@@ -640,7 +648,7 @@ SS_PHPUNIT_FLUSH=1 vendor/bin/phpunit vendor/restruct/silverstripe-queuedjobs-en
 # (the profiler task's exit codes exist, and are asserted, on SS6 only)
 
 # The drain wrapper, no PHP or database needed (every lock tool available here); --mutants checks
-# that four broken copies of the wrapper each fail it
+# that seven broken copies of the wrapper each fail it
 bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-test.sh
 bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-test.sh --mutants
 ```
