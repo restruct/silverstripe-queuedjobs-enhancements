@@ -552,7 +552,9 @@ default `server_vars`); any other error reporter can read them from `$_SERVER`.
 Runs a job's `setup()` + `process()` loop in-process and prints, per `process()` call, memory
 (+ delta), peak, the real `currentStep`, the serialised `jobData` size and the message count, then
 a summary. It answers "does this job accumulate, and where?". **Dev-only**: it really runs the job,
-so it writes whatever the job writes; outside `dev` it refuses.
+so it writes whatever the job writes; outside `dev` it refuses. Over HTTP it also needs ADMIN
+(since 1.7.1): in `dev` mode the task runner is open to any visitor, so the CLI or an administrator
+only.
 
 ```bash
 # Silverstripe 6 (options; the same spelling works in the browser task runner)

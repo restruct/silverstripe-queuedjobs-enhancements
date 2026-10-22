@@ -136,4 +136,86 @@ class QueuedJobProfileTaskTest extends SapphireTest
             }
         }
     }
+
+    /**
+     * Run the task as an HTTP request through dev/tasks would: isCli() reports false (PHPUnit
+     * itself always runs on the CLI SAPI), and on SS6 the output is a decorated FORMAT_HTML
+     * PolyOutput, as the browser task runner creates it. Returns [result code, output].
+     *
+     * @return array{0: int|null, 1: string}
+     */
+    protected function runTaskOverHttp(array $options): array
+    {
+        $task = new class extends QueuedJobProfileTask {
+            protected function isCli(): bool
+            {
+                return false;
+            }
+        };
+
+        if (!class_exists(PolyOutput::class)) {
+            ob_start();
+            $task->run(new HTTPRequest('GET', 'dev/tasks/qjob-profile', $options));
+
+            return [null, (string) ob_get_clean()];
+        }
+
+        $args = [];
+        foreach ($options as $name => $value) {
+            $args['--' . $name] = $value;
+        }
+        $input = new ArrayInput($args, new InputDefinition($task->getOptions()));
+        $input->setInteractive(false);
+        $buffer = new BufferedOutput();
+        $code = $task->run($input, new PolyOutput(PolyOutput::FORMAT_HTML, decorated: true, wrappedOutput: $buffer));
+
+        return [$code, $buffer->fetch()];
+    }
+
+    /**
+     * In dev mode dev/tasks is open to anyone over HTTP. 1.7.0 checked isDev() only, so an
+     * anonymous visitor could make the task run any job class.
+     */
+    public function testRefusesAnHttpVisitorWhoIsNotAdmin(): void
+    {
+        $this->logOut();
+        [$code, $output] = $this->runTaskOverHttp(['class' => StubMultiStepJob::class]);
+
+        $this->assertStringContainsString('Run this task from the CLI, or log in as an administrator', $output);
+        $this->assertStringNotContainsString('Profiling', $output);
+        $this->assertSame([], StubWorkerHooks::$ran, 'the job must not run');
+        if ($code !== null) {
+            $this->assertSame(1, $code);
+        }
+
+        # A logged-in member without ADMIN is refused the same way
+        $this->logInWithPermission('CMS_ACCESS_CMSMain');
+        [, $output] = $this->runTaskOverHttp(['class' => StubMultiStepJob::class]);
+        $this->assertStringContainsString('Run this task from the CLI, or log in as an administrator', $output);
+        $this->assertSame([], StubWorkerHooks::$ran, 'the job must not run');
+    }
+
+    public function testRunsForAnAdminOverHttp(): void
+    {
+        $this->logInWithPermission('ADMIN');
+
+        [, $output] = $this->runTaskOverHttp(['class' => StubMultiStepJob::class]);
+
+        $this->assertStringContainsString('COMPLETE after 3 call(s)', $output);
+        $this->assertSame(['#1', '#2', '#3'], StubWorkerHooks::$ran);
+    }
+
+    /**
+     * The `class` parameter is echoed back ("Not a queued job class: ..."). In the browser it must
+     * arrive as text; on SS5 1.7.0 echoed it raw (reflected XSS).
+     */
+    public function testRequestClassIsHtmlEscapedInTheBrowser(): void
+    {
+        $this->logInWithPermission('ADMIN');
+
+        [, $output] = $this->runTaskOverHttp(['class' => '<script>x</script>']);
+
+        $this->assertStringContainsString('Not a queued job class: &lt;script&gt;x&lt;/script&gt;', $output);
+        $this->assertStringNotContainsString('<script>', $output);
+    }
 }
