@@ -3,6 +3,13 @@
     "description": "Progress tracking, immediate execution, and consolidation utilities for symbiote/silverstripe-queuedjobs",
     "type": "silverstripe-vendormodule",
     "license": "MIT",
+    "authors": [
+        {
+            "name": "Restruct",
+            "email": "dev@restruct.nl",
+            "homepage": "https://restruct.nl"
+        }
+    ],
     "require": {
         "php": "^8.1",
         "silverstripe/framework": "^5.4 || ^6",
