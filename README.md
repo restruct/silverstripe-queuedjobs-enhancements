@@ -1,63 +1,49 @@
-# Silverstripe QueuedJobs Enhancements
+# QueuedJobs enhancements for Silverstripe
 
-Progress tracking, immediate execution, and consolidation utilities for [symbiote/silverstripe-queuedjobs](https://github.com/symbiote/silverstripe-queuedjobs).
+Make [symbiote/silverstripe-queuedjobs](https://github.com/symbiote/silverstripe-queuedjobs) feel
+immediate. A job queued on the `IMMEDIATE` queue starts within about a second, without a resident
+worker; the browser can show a job's progress live; and a method call or a composed email can be
+queued in one line. Opt-in tools cover what a busy queue runs into: a per-class concurrency guard,
+lock refresh for long jobs, bounded message logs, a memory profiler, and the job's name in fatal
+error reports. For Silverstripe 5 and 6.
 
-`symbiote/silverstripe-queuedjobs` is solid for background processing, but the developer and end-user experience around it has some rough edges: a queued job gives no live feedback (the browser only learns it finished on the next page reload), jobs wait for the next cron tick before they start, and there is no first-class way to queue a one-off method call or send a composed Email asynchronously. This module adds those pieces as small, independent components that sit **alongside** the core module — it never replaces or subclasses core QueuedJobs classes.
+*Maintained by [Restruct](https://github.com/restruct). If this module saves you time, you can
+[support ongoing maintenance](https://github.com/sponsors/restruct).*
 
-## Requirements
+## A queued job waits for cron, and says nothing until it is done
 
-- PHP `^8.1` (Silverstripe 6 itself needs 8.3)
-- `silverstripe/framework` `^5.4 || ^6`
-- `symbiote/silverstripe-queuedjobs` `^5 || ^6`
+`symbiote/silverstripe-queuedjobs` is solid for background processing, but the developer and
+end-user experience around it has some rough edges: a queued job gives no live feedback (the
+browser only learns it finished on the next page reload), jobs wait for the next cron tick before
+they start, and there is no first-class way to queue a one-off method call or send a composed
+Email asynchronously. Under load more shows: two scheduled runs of the same job class can overlap,
+a job running longer than `worker_ttl` can be restarted while it still runs, a job that logs in a loop
+re-serialises its whole message log on every step, and a job that dies of a fatal error is
+reported under the runner's name, not its own.
 
-`composer.json` is the source of truth. One code line serves both majors:
+This module adds those pieces as small, independent components that sit **alongside** the core
+module. It uses extensions and services of its own; the one subclass of a core class
+(`EnhancedQueuedJobService`, for the concurrency guard) is only used when a project swaps it in
+(see [Design principles](#design-principles)).
 
-| Branch | Module version | Silverstripe | queuedjobs | PHP |
-|---|---|---|---|---|
-| `main` | 1.5.0 and later | 5.4+ and 6 | 5 and 6 | 8.1+ (SS5), 8.3+ (SS6) |
-| tags up to `1.4.0` | 1.0.0 to 1.4.0 | 5 only | 5 | 8.1+ |
+## Twelve additions, each usable on its own
 
-Where the two majors differ, the module detects which one is installed and does the right thing:
-the dev tasks have a separate entry point per major (see `src/Tasks/*EntryPoint.php`), and the
-drain spawn runs `cli-script.php` on Silverstripe 5 and `bin/sake` on Silverstripe 6.
+| | What | On by default |
+|---|---|---|
+| 1 | [Job progress](#1-job-progress-tracking): a JSON endpoint and a dependency-free JS component that polls it | yes (the endpoint) |
+| 2 | [Immediate execution](#2-immediate-job-execution): jobs on the `IMMEDIATE` queue start within about a second, in a background CLI process | yes |
+| 3 | [Default-job diagnostics](#3-default-job-diagnostics-is_default_job): which default jobs are declared, and whether they are queued | task |
+| 4 | [ScheduledMethodCall](#4-scheduledmethodcall): queue any method call as a job | when used |
+| 5 | [SendEmailJob](#5-sendemailjob): send a composed `Email` asynchronously | when used |
+| 6 | [CleanupBrokenJobsTask](#6-cleanupbrokenjobstask): delete every `Broken` job | task |
+| 7 | [Concurrency guard](#7-concurrency-guard-prevent_concurrent_runs): one running job per class, for jobs that opt in | opt-in |
+| 8 | [Drain runner](#8-drain-runner-queuedjobswork): the one-shot runner behind immediate execution | yes |
+| 9 | [Job context for error reports](#9-job-context-for-error-reports): the running job in `$_SERVER`, so a fatal names it | yes |
+| 10 | [Queued job profiler](#10-queued-job-profiler-qjob-profile): memory, step and `jobData` size per `process()` call | dev task |
+| 11 | [Bounded job messages](#11-bounded-job-messages): a trait that caps a job's message log | opt-in |
+| 12 | [Lock refresh](#12-lock-refresh-queuedjobleaserefreshextension-off-by-default): a long job is only restarted when a single step outlasts `worker_ttl` | opt-in |
 
-## Installation
-
-```bash
-composer require restruct/silverstripe-queuedjobs-enhancements
-```
-
-Then flush the manifest - visit any URL with `?flush=1`, or:
-
-```bash
-# Silverstripe 5
-php vendor/silverstripe/framework/cli-script.php dev/build flush=1
-# Silverstripe 6
-vendor/bin/sake db:build --flush
-```
-
-The module registers:
-
-- A route `api/job-progress//$ID` → `JobProgressController` (via `_config/routes.yml`).
-- Three dev tasks: `check-default-jobs`, `cleanup-broken-jobs` and `qjob-profile` (dev-only) (`dev/tasks/<name>` on Silverstripe 5, `sake tasks:<name>` on Silverstripe 6).
-- The drain runner: `sake queuedjobs:work` on Silverstripe 6, `dev/tasks/QueuedJobsWorkTask` on
-  Silverstripe 5 (see [§8](#8-drain-runner-queuedjobswork)). It adds no tables.
-- Exposes `client/` (for `client/js/job-progress.js`) via `extra.expose` in `composer.json`.
-- Three extensions on `QueuedJobDescriptor`: `QueuedJobDescriptorDrainExtension` (every new job on the
-  `IMMEDIATE` queue starts a background drain, see [§2](#2-immediate-job-execution); switch it off
-  with `DrainSpawner.enabled: false`), `QueuedJobContextExtension` (records the running job in
-  `$_SERVER` for error reports, see [§9](#9-job-context-for-error-reports)) and
-  `QueuedJobDescriptorPermissionExtension` (`canView()` for the member a job runs as, see
-  [§1](#1-job-progress-tracking)).
-
-<!-- It registers no extensions and adds no runtime hooks — nothing runs unless you call it. -->
-<!-- Apart from the drain spawn it adds no runtime hooks: nothing else runs unless you call it. -->
-<!-- Apart from these two descriptor hooks it adds no runtime hooks: nothing else runs unless you call it. -->
-Apart from the two descriptor write hooks it adds no runtime hooks: nothing else runs unless you call it.
-
-## Features
-
-Each feature is independently useful — use only what you need.
+Each feature is independently useful - use only what you need.
 
 ### 1. Job Progress Tracking
 
@@ -335,7 +321,7 @@ which Silverstripe 6 rejects and Silverstripe 5 logs as an error.
 ### 3. Default-Job Diagnostics (`$is_default_job`)
 
 > **Scheduling is core's job, not this module's.** `QueuedJobService::runQueue()` calls
-> `checkDefaultJobs()` on *every* invocation, and `ProcessJobQueueTask` calls `runQueue()` —
+> `checkDefaultJobs()` on *every* invocation, and `ProcessJobQueueTask` calls `runQueue()` -
 > so a plain YAML `defaultJobs` block is already re-checked on every cron tick, with **zero**
 > extra setup, plus core's alert emails and health-check integration. This module therefore
 > **does not create or schedule default jobs**. It only reports what's declared, and can
@@ -344,7 +330,7 @@ which Silverstripe 6 rejects and Silverstripe 5 logs as an error.
 > (It cannot hand discovered jobs to core either: `QueuedJobService::$defaultJobs` is a public
 > property populated via Injector `properties:`, and neither `runQueue()` nor `checkDefaultJobs()`
 > exposes an extension hook. Re-implementing core's creation logic to work around that is what
-> earlier versions did — and it bought nothing but a second, less capable mechanism.)
+> earlier versions did - and it bought nothing but a second, less capable mechanism.)
 
 Declare a job's schedule next to the job itself:
 
@@ -360,7 +346,7 @@ class DataSyncJob extends AbstractQueuedJob implements QueuedJob
 }
 ```
 
-`DefaultJobManager` discovers every concrete `AbstractQueuedJob` subclass with `$is_default_job = true` (via `ClassInfo::subclassesFor()`, skipping abstract classes) and reports whether each has an *active* instance in the queue — "active" meaning a descriptor in a non-terminal status (`New`, `Initialising`, `Running`, `Waiting`, `Paused`).
+`DefaultJobManager` discovers every concrete `AbstractQueuedJob` subclass with `$is_default_job = true` (via `ClassInfo::subclassesFor()`, skipping abstract classes) and reports whether each has an *active* instance in the queue - "active" meaning a descriptor in a non-terminal status (`New`, `Initialising`, `Running`, `Waiting`, `Paused`).
 
 **Report what's declared and whether it's queued:**
 
@@ -376,13 +362,13 @@ sake dev/tasks/check-default-jobs yaml=1    # Silverstripe 5
 sake tasks:check-default-jobs --yaml        # Silverstripe 6
 ```
 
-That emits exactly the structure core's `checkDefaultJobs()` expects (`type`, `filter`, `recreate`, `construct`, `startDateFormat`, `startTimeString`, and `jobType` when `$default_job_type` is set). Paste it into e.g. `app/_config/queuedjobs.yml` and core takes over — creation, alert emails, health checks. You get the co-location benefit while authoring, without a second runtime mechanism to maintain.
+That emits exactly the structure core's `checkDefaultJobs()` expects (`type`, `filter`, `recreate`, `construct`, `startDateFormat`, `startTimeString`, and `jobType` when `$default_job_type` is set). Paste it into e.g. `app/_config/queuedjobs.yml` and core takes over - creation, alert emails, health checks. You get the co-location benefit while authoring, without a second runtime mechanism to maintain.
 
 > `jobType` restricts recreation to runs of *that* queue, so if you set `$default_job_type`, make sure a runner processes that queue.
 
 ### 4. ScheduledMethodCall
 
-Queue any method call as a background job — the bridge between "I have a method" and "I want it queued." Instance calls store the object's ID + class and re-fetch the `DataObject` when the job runs; static/other-object calls store the class name.
+Queue any method call as a background job - the bridge between "I have a method" and "I want it queued." Instance calls store the object's ID + class and re-fetch the `DataObject` when the job runs; static/other-object calls store the class name.
 
 ```php
 use Restruct\QueuedJobsEnhancements\Jobs\ScheduledMethodCall;
@@ -419,7 +405,7 @@ Restruct\QueuedJobsEnhancements\Extensions\QueuedJobsAdminJobTypesExtension:
     - App\Jobs\MyGenericJob
 ```
 
-> **For Emails, use [SendEmailJob](#5-sendemailjob) — ScheduledMethodCall cannot carry them.** An `Email` is not a `DataObject`: this job persists class+ID and re-fetches, so a composed Email cannot ride along (the naive attempt ends up calling `Email::send()` statically on an empty singleton).
+> **For Emails, use [SendEmailJob](#5-sendemailjob) - ScheduledMethodCall cannot carry them.** An `Email` is not a `DataObject`: this job persists class+ID and re-fetches, so a composed Email cannot ride along (the naive attempt ends up calling `Email::send()` statically on an empty singleton).
 
 **Options (4th argument):**
 
@@ -451,13 +437,13 @@ QueuedJobService::singleton()->queueJob($job);
 // ...cron (or ImmediateJobRunner::queueAndRun($job)) rebuilds and sends it
 ```
 
-The implementation embodies three hard-won SS5/Symfony traps — each broke production at some point, and each is comment-documented in the class:
+The implementation embodies three hard-won SS5/Symfony traps - each broke production at some point, and each is comment-documented in the class:
 
-1. Addresses are stored as `[email => name]` maps — `getTo()` returns Symfony `Address` *objects*, and feeding those back into `setTo()` double-wraps them (`new Address($addressObject)` → TypeError).
-2. The body is read via `getHtmlBody()` — the assembled `getBody()` returns a Symfony `TextPart` that is **not** string-castable.
-3. Reply-to uses `setReplyTo(string $address, string $name)` (not a map), unpacked from a **local copy** of the jobData property — `reset()` on the overloaded magic property raises "Indirect modification of overloaded property".
+1. Addresses are stored as `[email => name]` maps - `getTo()` returns Symfony `Address` *objects*, and feeding those back into `setTo()` double-wraps them (`new Address($addressObject)` → TypeError).
+2. The body is read via `getHtmlBody()` - the assembled `getBody()` returns a Symfony `TextPart` that is **not** string-castable.
+3. Reply-to uses `setReplyTo(string $address, string $name)` (not a map), unpacked from a **local copy** of the jobData property - `reset()` on the overloaded magic property raises "Indirect modification of overloaded property".
 
-> **Limitation:** the round-trip carries **To / From / Subject / HTML body / CC / BCC / Reply-To only** — **no attachments and no custom headers**. That's fine for notification mail; do not assume full `Email` fidelity.
+> **Limitation:** the round-trip carries **To / From / Subject / HTML body / CC / BCC / Reply-To only** - **no attachments and no custom headers**. That's fine for notification mail; do not assume full `Email` fidelity.
 
 A job whose recipient data was lost completes gracefully with a "skipping" message rather than breaking the queue runner.
 
@@ -488,7 +474,7 @@ class MySlowSyncJob extends AbstractQueuedJob implements QueuedJob
 }
 ```
 
-…and enable the service swap **per project** (the module deliberately does not register it):
+Then enable the service swap **per project** (the module deliberately does not register it):
 
 ```yaml
 SilverStripe\Core\Injector\Injector:
@@ -496,27 +482,27 @@ SilverStripe\Core\Injector\Injector:
     class: Restruct\QueuedJobsEnhancements\Services\EnhancedQueuedJobService
 ```
 
-An existing `properties:` block (defaultJobs etc.) on that injector key keeps applying —
+An existing `properties:` block (defaultJobs etc.) on that injector key keeps applying -
 `class:` and `properties:` merge into the one spec.
 
 When a guarded job's descriptor is about to start while ANOTHER descriptor of the same
 `Implementation` is active (`Initialising`/`Running`/`Waiting`, or holding a committed
 `Worker` claim), it is **deferred**: its claim is released and `StartAfter` is pushed
 forward (`ConcurrencyGuard.defer_seconds`, default 300). No job lifecycle fires for a
-deferred run — no `setup()`, no `afterComplete()`, no mails — it simply starts once the
+deferred run - no `setup()`, no `afterComplete()`, no mails - it simply starts once the
 active run has finished. `Waiting` (memory/time-parked) siblings deliberately count as
 active: a parked job is half-done and about to resume in a fresh process.
 
-**Race-safety (claim-then-verify):** the guard piggybacks on `grabMutex()` — each contender
+**Race-safety (claim-then-verify):** the guard piggybacks on `grabMutex()` - each contender
 first COMMITS its own per-descriptor Worker-token claim, then verifies for active siblings.
 Two contenders can therefore never both proceed (each would have to verify before the
 other's committed claim); worst case both back off and the next runner tick resolves it.
-This also covers every start path — new jobs, `Waiting` resumes, stall restarts — and both
+This also covers every start path - new jobs, `Waiting` resumes, stall restarts - and both
 engines (`QueueRunner` in-process, `DoormanRunner` via its child task), since all of them
 funnel through `QueuedJobService::runJob()` → `grabMutex()`.
 
 **Already running your own `QueuedJobService` subclass?** PHP's single inheritance means two
-subclasses can't be merged — instead add `use ConcurrencyGuardedMutex;` to your subclass (the
+subclasses can't be merged - instead add `use ConcurrencyGuardedMutex;` to your subclass (the
 trait carries the whole override; all tunables live on `ConcurrencyGuard`, a real class,
 because config declared on a trait does not merge), or call `ConcurrencyGuard` yourself from
 your own `grabMutex()`.
@@ -718,7 +704,66 @@ running descriptor (the CMS, a script) holds no token and changes nothing.
 It is off by default because it changes how stuck jobs are detected on every queue of the site.
 **Remove it once upstream refreshes the lock itself**; upstream has no such refresh today (6.2.3).
 
-## Dev Tasks
+## Technical
+
+### Requirements and compatibility
+
+- PHP `^8.1` (Silverstripe 6 itself needs 8.3)
+- `silverstripe/framework` `^5.4 || ^6`
+- `symbiote/silverstripe-queuedjobs` `^5 || ^6`
+
+`composer.json` is the source of truth. One code line serves both majors:
+
+| Branch | Module version | Silverstripe | queuedjobs | PHP |
+|---|---|---|---|---|
+| `main` | 1.5.0 and later | 5.4+ and 6 | 5 and 6 | 8.1+ (SS5), 8.3+ (SS6) |
+| tags up to `1.4.0` | 1.0.0 to 1.4.0 | 5 only | 5 | 8.1+ |
+
+Where the two majors differ, the module detects which one is installed and does the right thing:
+the dev tasks have a separate entry point per major (see `src/Tasks/*EntryPoint.php`), and the
+drain spawn runs `cli-script.php` on Silverstripe 5 and `bin/sake` on Silverstripe 6.
+
+### Installation
+
+```bash
+composer require restruct/silverstripe-queuedjobs-enhancements
+```
+
+Then flush the manifest - visit any URL with `?flush=1`, or:
+
+```bash
+# Silverstripe 5
+php vendor/silverstripe/framework/cli-script.php dev/build flush=1
+# Silverstripe 6
+vendor/bin/sake db:build --flush
+```
+
+The module registers:
+
+- A route `api/job-progress//$ID` → `JobProgressController` (via `_config/routes.yml`).
+- Three dev tasks: `check-default-jobs`, `cleanup-broken-jobs` and `qjob-profile` (dev-only) (`dev/tasks/<name>` on Silverstripe 5, `sake tasks:<name>` on Silverstripe 6).
+- The drain runner: `sake queuedjobs:work` on Silverstripe 6, `dev/tasks/QueuedJobsWorkTask` on
+  Silverstripe 5 (see [§8](#8-drain-runner-queuedjobswork)). It adds no tables.
+- Exposes `client/` (for `client/js/job-progress.js`) via `extra.expose` in `composer.json`.
+- Four extensions on `QueuedJobDescriptor`: `QueuedJobDescriptorDrainExtension` (every new job on the
+  `IMMEDIATE` queue starts a background drain, see [§2](#2-immediate-job-execution); switch it off
+  with `DrainSpawner.enabled: false`), `QueuedJobContextExtension` (records the running job in
+  `$_SERVER` for error reports, see [§9](#9-job-context-for-error-reports)),
+  `QueuedJobDescriptorPermissionExtension` (`canView()` for the member a job runs as, see
+  [§1](#1-job-progress-tracking)) and `QueuedJobLeaseRefreshExtension` (does nothing until enabled,
+  see [§12](#12-lock-refresh-queuedjobleaserefreshextension-off-by-default)).
+- One extension on `QueuedJobsAdmin`: `QueuedJobsAdminJobTypesExtension` (keeps `ScheduledMethodCall`
+  out of the "Create job of type" form, see [§4](#4-scheduledmethodcall)).
+
+<!-- It registers no extensions and adds no runtime hooks — nothing runs unless you call it. -->
+<!-- Apart from the drain spawn it adds no runtime hooks: nothing else runs unless you call it. -->
+<!-- Apart from these two descriptor hooks it adds no runtime hooks: nothing else runs unless you call it. -->
+<!-- Apart from the two descriptor write hooks it adds no runtime hooks: nothing else runs unless you call it. -->
+Apart from the hooks of these extensions (descriptor writes, the lock refresh's only when enabled,
+the RunAs `canView()` and the Jobs admin form filter) it adds no runtime hooks: nothing else runs
+unless you call it.
+
+### Dev tasks
 
 | Task | SS5 segment / SS6 command | Description |
 |------|---------|-------------|
@@ -727,7 +772,7 @@ It is off by default because it changes how stuck jobs are detected on every que
 | Drain runner | `QueuedJobsWorkTask` / `queuedjobs:work` | One-shot runner started by the drain spawn (§8). CLI only. |
 | Profile a queued job | `qjob-profile` / `tasks:qjob-profile` | Run a job in-process and report memory, step, `jobData` size and message count per `process()` call (§10). Dev-only. |
 
-## Module Structure
+### Module structure
 
 ```
 src/
@@ -738,6 +783,8 @@ src/
 ├── Extensions/
 │   ├── QueuedJobContextExtension.php   # running job -> $_SERVER QUEUED_JOB(_MEMORY)
 │   ├── QueuedJobLeaseRefreshExtension.php  # opt-in: move a running job's Expiry forward per step
+│   ├── QueuedJobDescriptorPermissionExtension.php  # canView() for the member a job runs as
+│   ├── QueuedJobsAdminJobTypesExtension.php  # ScheduledMethodCall out of "Create job of type"
 │   └── QueuedJobDescriptorDrainExtension.php  # new IMMEDIATE descriptor -> drain spawn
 ├── Jobs/
 │   ├── BoundedJobMessages.php          # Opt-in trait: bounded message log
@@ -769,7 +816,7 @@ bin/
 └── qje-drain.sh                        # Drain wrapper: lock, marker, one-shot runner loop
 ```
 
-## Testing
+### Testing
 
 Run from a host project that requires the module as a symlinked path repository (`/tests` must
 be present, so not a dist install):
@@ -795,20 +842,20 @@ Silverstripe 6 (PHP 8.3), then boots each host, builds the database and runs bot
 
 The suite covers the controller (auth/permission/response shape, `404` for a job the member may not view, the generic message of a `Broken` job for non-admins), the RunAs `canView()` extension, the Jobs admin create-job form (`ScheduledMethodCall` not offered, a crafted POST refused), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask` and `CheckDefaultJobsTask` (output HTML-escaped in the browser), `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal, the CLI-or-ADMIN refusal over HTTP, escaped browser output), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 
-> **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` — the tests follow this convention deliberately.
+> **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` - the tests follow this convention deliberately.
 
-> **Stale manifest tip:** if tests fail with `getItemPath returned null … Try adding flush=1`, the class manifest cache is stale. Flush it (`?flush=1`, or clear the `silverstripe-cache-*` dir) and re-run.
+> **Stale manifest tip:** if tests fail with `getItemPath returned null ... Try adding flush=1`, the class manifest cache is stale. Flush it (`?flush=1`, or clear the `silverstripe-cache-*` dir) and re-run.
 
-## Design Principles
+### Design principles
 
-1. **Never replace or subclass core QueuedJobs classes — unless there is no hook, and then only opt-in.** Extensions where hooks exist, complementary services alongside. The one exception is `EnhancedQueuedJobService` (concurrency guard): `QueuedJobService` exposes no extension point at job selection or `grabMutex()`, so a subclass is the only non-fork option — it overrides that single method, is inert unless a job opts in, and the Injector swap is never registered by the module itself (each project enables it explicitly).
-2. **Play well with existing infrastructure.** If `inotifywait` is set up, switch the drain spawn off (`DrainSpawner.enabled: false`) and let it run the IMMEDIATE queue (note: `inotifywait` is not installed by default — it comes from the `inotify-tools` package). If `defaultJobs` YAML exists, it keeps working. Respect the existing job runner.
-3. **CLI spawn over FPM tricks.** Background processes via `exec()` are more robust and portable than `fastcgi_finish_request()`, and — unlike it — do not hold a PHP-FPM worker for the duration of the job.
+1. **Never replace or subclass core QueuedJobs classes - unless there is no hook, and then only opt-in.** Extensions where hooks exist, complementary services alongside. The one exception is `EnhancedQueuedJobService` (concurrency guard): `QueuedJobService` exposes no extension point at job selection or `grabMutex()`, so a subclass is the only non-fork option - it overrides that single method, is inert unless a job opts in, and the Injector swap is never registered by the module itself (each project enables it explicitly).
+2. **Play well with existing infrastructure.** If `inotifywait` is set up, switch the drain spawn off (`DrainSpawner.enabled: false`) and let it run the IMMEDIATE queue (note: `inotifywait` is not installed by default - it comes from the `inotify-tools` package). If `defaultJobs` YAML exists, it keeps working. Respect the existing job runner.
+3. **CLI spawn over FPM tricks.** Background processes via `exec()` are more robust and portable than `fastcgi_finish_request()`, and - unlike it - do not hold a PHP-FPM worker for the duration of the job.
 4. **Traits over base classes.** (Future: a `MultiStepJob` trait for sequential/parallel/dynamic step processing with flow control.)
 
-## Migration from admintweaks
+### Migration from admintweaks
 
-`ScheduledMethodCall` and `CleanupBrokenJobsTask` were consolidated from `restruct/silverstripe-admintweaks`; `QueuedJobContextExtension` and `QueuedJobProfileTask` followed in 1.7.0. If you used them from there, update the namespace — the API is identical, only the `use` statement changes:
+`ScheduledMethodCall` and `CleanupBrokenJobsTask` were consolidated from `restruct/silverstripe-admintweaks`; `QueuedJobContextExtension` and `QueuedJobProfileTask` followed in 1.7.0. If you used them from there, update the namespace - the API is identical, only the `use` statement changes:
 
 | Old (admintweaks) | New (this module) |
 |---|---|
@@ -822,20 +869,25 @@ mark them deprecated) stops registering its extension and disables its task when
 classes exist, so each runs once, under the same task name (`qjob-profile`). With an older
 admintweaks both extensions run; they write the same keys with the same values, which is harmless.
 
-## Background & research
+### Background and research
 
 This module was designed and evaluated in a longer research document before implementation. It realizes **Phases 1, 2 and 5** of that research (progress tracking, immediate execution, self-declaring default jobs, and the admintweaks consolidation). The design rationale, alternatives that were considered and rejected (WebSockets/SSE, FPM shutdown tricks, replacing core classes), and the SS5→SS6 closure-library migration notes are distilled in [docs/RESEARCH.md](docs/RESEARCH.md).
 
 The full original evaluation is kept in internal research notes. This module does not depend on them, and [docs/RESEARCH.md](docs/RESEARCH.md) is self-contained.
 
-## Roadmap
+### Roadmap
 
 Planned (not yet built):
 
-- **Push notifications** — Web Push on job completion (e.g. via `minishlink/web-push`).
-- **`MultiStepJob` trait** — sequential/parallel/dynamic multi-step processing with a `StepResult` flow-control value object (`next()`, `repeat()`, `goto()`, `spawn()`, `complete()`).
-- **`JobDispatchAction` trait** — CMS action buttons that dispatch jobs with one click and switch into progress-polling mode.
+- **Push notifications** - Web Push on job completion (e.g. via `minishlink/web-push`).
+- **`MultiStepJob` trait** - sequential/parallel/dynamic multi-step processing with a `StepResult` flow-control value object (`next()`, `repeat()`, `goto()`, `spawn()`, `complete()`).
+- **`JobDispatchAction` trait** - CMS action buttons that dispatch jobs with one click and switch into progress-polling mode.
 
-## License
+### Further reading
+
+- [CHANGELOG.md](CHANGELOG.md) - release history
+- [docs/RESEARCH.md](docs/RESEARCH.md) - design rationale and the alternatives that were rejected
+
+### License
 
 MIT
