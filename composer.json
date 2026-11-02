@@ -1,6 +1,14 @@
 {
     "name": "restruct/silverstripe-queuedjobs-enhancements",
-    "description": "Progress tracking, immediate execution, and consolidation utilities for symbiote/silverstripe-queuedjobs",
+    "description": "Jobs that start within a second, live progress in the browser, queued method calls and emails, and opt-in safeguards for busy queues, for symbiote/silverstripe-queuedjobs",
+    "keywords": [
+        "silverstripe",
+        "silverstripe-module",
+        "queuedjobs",
+        "background-jobs",
+        "job-queue",
+        "async"
+    ],
     "type": "silverstripe-vendormodule",
     "license": "MIT",
     "authors": [
