@@ -26,7 +26,7 @@ module. It uses extensions and services of its own; the one subclass of a core c
 (`EnhancedQueuedJobService`, for the concurrency guard) is only used when a project swaps it in
 (see [Design principles](#design-principles)).
 
-## Twelve additions, each usable on its own
+## Thirteen additions, each usable on its own
 
 | | What | On by default |
 |---|---|---|
@@ -42,6 +42,7 @@ module. It uses extensions and services of its own; the one subclass of a core c
 | 10 | [Queued job profiler](#10-queued-job-profiler-qjob-profile): memory, step and `jobData` size per `process()` call | dev task |
 | 11 | [Bounded job messages](#11-bounded-job-messages): a trait that caps a job's message log | opt-in |
 | 12 | [Lock refresh](#12-lock-refresh-queuedjobleaserefreshextension-off-by-default): a long job is only restarted when a single step outlasts `worker_ttl` | opt-in |
+| 13 | [Reconnect after "gone away"](#13-reconnect-after-gone-away-reconnectsafterdbgoneaway): a trait that lets a long job survive a database restart | opt-in |
 
 Each feature is independently useful - use only what you need.
 
@@ -704,6 +705,47 @@ running descriptor (the CMS, a script) holds no token and changes nothing.
 It is off by default because it changes how stuck jobs are detected on every queue of the site.
 **Remove it once upstream refreshes the lock itself**; upstream has no such refresh today (6.2.3).
 
+### 13. Reconnect after "gone away" (`ReconnectsAfterDbGoneAway`)
+
+A database restart in the middle of a long job (for example after OS library updates) kills the
+job, and usually the runner with it. The MySQLi connector does not reconnect on its own. Upstream's
+`QueuedJobService` writes the descriptor right after `process()` returns, outside the job's own
+catch, so a job that only catches the error still dies on that write. The opt-in
+`ReconnectsAfterDbGoneAway` trait reconnects from the job's catch block, so the job can retry its
+step:
+
+```php
+use Restruct\QueuedJobsEnhancements\Jobs\ReconnectsAfterDbGoneAway;
+
+class SyncJob extends AbstractQueuedJob
+{
+    use ReconnectsAfterDbGoneAway;
+
+    public function process()
+    {
+        try {
+            $this->syncNextBatch();
+        } catch (\Throwable $e) {
+            if ($this->reconnectAfterDbGoneAway($e)) {
+                return; // reconnected: the next process() call retries this step
+            }
+            throw $e;
+        }
+    }
+}
+```
+
+- `is_db_gone_away($e)` recognises "server has gone away" (2006) and "Lost connection to MySQL
+  server" (2013). Any other error returns false at once, and the connection is left alone.
+- `reconnectAfterDbGoneAway($e)` reconnects with the configured credentials and proves it with
+  `SELECT 1`. If that fails, it waits `db_reconnect_wait_seconds` (60) and tries once more. Each
+  attempt is logged on the job as a WARNING.
+- One reconnect cycle per call. A retry cap, if the job wants one, belongs in the job.
+- The setting is read from the job class (a `private static`, or YAML keyed to the job class), as
+  for bounded messages.
+- In a `SapphireTest`, do not run the real reconnect: `DB::getConfig()` there still names the
+  main database, not the temporary test database.
+
 ## Technical
 
 ### Requirements and compatibility
@@ -788,6 +830,7 @@ src/
 │   └── QueuedJobDescriptorDrainExtension.php  # new IMMEDIATE descriptor -> drain spawn
 ├── Jobs/
 │   ├── BoundedJobMessages.php          # Opt-in trait: bounded message log
+│   ├── ReconnectsAfterDbGoneAway.php   # Opt-in trait: reconnect after a database restart
 │   ├── ScheduledMethodCall.php         # Queue method calls
 │   └── SendEmailJob.php                # Send a composed Email asynchronously
 ├── Services/

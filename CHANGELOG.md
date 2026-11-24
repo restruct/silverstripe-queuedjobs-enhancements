@@ -3,6 +3,17 @@
 All notable changes to this module. Versions before this file existed are described by their
 git tags (1.0.0 to 1.4.0).
 
+## Unreleased
+
+### Added
+
+- `ReconnectsAfterDbGoneAway`, an opt-in trait for long-running jobs (#9). From the job's catch
+  block, `reconnectAfterDbGoneAway($e)` reconnects after "server has gone away" (2006) or "Lost
+  connection to MySQL server" (2013), proves the connection with `SELECT 1`, and tries once more
+  after `db_reconnect_wait_seconds` (60). It returns true when the job can retry its step. Needed
+  because the MySQLi connector does not reconnect on its own, and upstream writes the descriptor
+  after `process()`, outside the job's catch.
+
 ## 1.8.0 (2026-10-22)
 
 ### Added
