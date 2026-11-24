@@ -4,6 +4,7 @@ namespace Restruct\QueuedJobsEnhancements\Tests\Jobs;
 
 use Restruct\QueuedJobsEnhancements\Jobs\ReconnectsAfterDbGoneAway;
 use Restruct\QueuedJobsEnhancements\Tests\Stubs\StubReconnectingJob;
+use SilverStripe\Core\Config\Config;
 use SilverStripe\Dev\SapphireTest;
 use SilverStripe\ORM\Connect\DatabaseException;
 use SilverStripe\ORM\DB;
@@ -42,6 +43,19 @@ class ReconnectsAfterDbGoneAwayTest extends SapphireTest
         $this->assertStringStartsWith('ss_tmpdb', (string) DB::get_conn()->getSelectedDatabase());
         # and nothing was logged on the job
         $this->assertSame([], array_values((array) $job->getJobData()->messages));
+    }
+
+    public function testWaitIsReadFromTheJobClassConfig(): void
+    {
+        $job = new StubReconnectingJob();
+        $method = new \ReflectionMethod($job, 'dbReconnectWaitSeconds');
+        $method->setAccessible(true);
+
+        # default when the job class sets nothing
+        $this->assertSame(60, $method->invoke($job));
+        # AbstractQueuedJob is not Configurable: set it through Config, keyed to the job class
+        Config::modify()->set(StubReconnectingJob::class, 'db_reconnect_wait_seconds', 5);
+        $this->assertSame(5, $method->invoke($job));
     }
 
     public function testJobUsesTheTrait(): void
