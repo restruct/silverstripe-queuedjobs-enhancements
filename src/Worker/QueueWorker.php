@@ -5,9 +5,11 @@ namespace Restruct\QueuedJobsEnhancements\Worker;
 use InvalidArgumentException;
 use Restruct\QueuedJobsEnhancements\Services\DrainSpawner;
 use Restruct\QueuedJobsEnhancements\Services\ImmediateJobRunner;
+use SilverStripe\Core\ClassInfo;
 use SilverStripe\Core\Config\Config;
 use SilverStripe\Core\Config\Configurable;
 use SilverStripe\Core\Injector\Injectable;
+use SilverStripe\Core\Resettable;
 use SilverStripe\i18n\i18n;
 use SilverStripe\ORM\DataObject;
 use SilverStripe\ORM\FieldType\DBDatetime;
@@ -61,6 +63,8 @@ use Throwable;
  * which the existing cron keeps calling. The worker is an addition to that cron, not a replacement.
  *
  * @config int|float $linger
+ * @config bool $reset_resettables_between_jobs
+ * @config array $resettables_skip
  */
 class QueueWorker
 {
@@ -85,6 +89,29 @@ class QueueWorker
      * The `linger` option of the task/command overrides this.
      */
     private static $linger = 2;
+
+    /**
+     * Between two jobs, call reset() on every SilverStripe\Core\Resettable implementor, as
+     * FlushableTestState does between two tests, so an in-memory cache that one job filled cannot
+     * reach the next job in the same process. Off by default in 1.x (#11): no field failure has been
+     * seen, some reset() implementations are costly (DataObject::reset() drops the schema and
+     * table caches), and code may rely on state carried over between jobs. See resettables_skip.
+     */
+    private static $reset_resettables_between_jobs = false;
+
+    /**
+     * Resettable classes that reset_resettables_between_jobs leaves alone. Either form works:
+     * a list entry (`- My\Service`) skips the class, and a keyed entry (`My\Service: true|false`)
+     * skips it or, with false, takes it off the list again. Config arrays merge, so the keyed false
+     * form is how a project resets a class that is skipped here by default.
+     *
+     * Versioned is skipped by default: the runner already puts the reading mode back after each job
+     * (runOneJob()), and Versioned::reset() would then clear it to '' and read the session of the
+     * current controller, which a Silverstripe 6 sake command does not have (an Error on every job).
+     */
+    private static $resettables_skip = [
+        'SilverStripe\Versioned\Versioned' => true,
+    ];
 
     /**
      * Option defaults. Names follow Laravel's `queue:work`.
@@ -450,7 +477,78 @@ class QueueWorker
         # served stale to a later one in the same process.
         DataObject::flush_and_destroy_cache();
 
+        # Opt-in (#11): what FlushableTestState does between tests. After the cache flush above,
+        # which stays as it is whether this is on or not.
+        if (static::config()->get('reset_resettables_between_jobs')) {
+            $this->resetResettables();
+        }
+
         gc_collect_cycles();
+    }
+
+    /**
+     * Call reset() on every Resettable that is not in resettables_skip. One implementor that throws
+     * is reported through the runner's output and does not stop the runner or skip the rest: a
+     * reset() written for the test state may assume a web request (a current controller, a session)
+     * that a CLI runner does not have.
+     */
+    protected function resetResettables(): void
+    {
+        $skip = static::skippedResettables();
+        foreach ($this->resettableClasses() as $class) {
+            # Manifest class names keep their case; the skip list is compared case-insensitively,
+            # as PHP class names are
+            if (isset($skip[strtolower($class)])) {
+                continue;
+            }
+            try {
+                $class::reset();
+            } catch (Throwable $e) {
+                $this->output(sprintf(
+                    'Resettable %s::reset() failed between jobs: %s',
+                    $class,
+                    $e->getMessage()
+                ));
+            }
+        }
+    }
+
+    /**
+     * The Resettable implementors to reset, in manifest order. A method of its own so a test can
+     * control the order.
+     *
+     * @return string[] class names
+     */
+    protected function resettableClasses(): array
+    {
+        return array_values(ClassInfo::implementorsOf(Resettable::class));
+    }
+
+    /**
+     * resettables_skip as a set of lower-cased class names (see its doc for the two forms).
+     *
+     * @return array<string, true>
+     */
+    protected static function skippedResettables(): array
+    {
+        $skip = [];
+        $unskip = [];
+        foreach ((array) static::config()->get('resettables_skip') as $key => $value) {
+            if (is_int($key)) {
+                # List form: the value is the class
+                if (is_string($value) && $value !== '') {
+                    $skip[strtolower($value)] = true;
+                }
+            } elseif ($value) {
+                # Keyed form, true: skip
+                $skip[strtolower($key)] = true;
+            } else {
+                # Keyed form, false: reset after all, whatever order the merged config has
+                $unskip[strtolower($key)] = true;
+            }
+        }
+
+        return array_diff_key($skip, $unskip);
     }
 
     /**

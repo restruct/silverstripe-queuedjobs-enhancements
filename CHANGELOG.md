@@ -3,6 +3,19 @@
 All notable changes to this module. Versions before this file existed are described by their
 git tags (1.0.0 to 1.4.0).
 
+## [Unreleased]
+
+### Added
+
+- `QueueWorker.reset_resettables_between_jobs`, off by default (#11): between two jobs the drain
+  runner calls `reset()` on every `SilverStripe\Core\Resettable` implementor, as
+  `FlushableTestState` does between two tests, so an in-memory cache filled by one job cannot reach
+  the next job in the same process. `QueueWorker.resettables_skip` lists implementors to leave
+  alone (list entries, or `Class: true|false`); `Versioned` is on it by default, because the runner
+  already restores the reading mode and `Versioned::reset()` needs a current controller, which a
+  Silverstripe 6 sake command does not have. A `reset()` that throws is reported in the runner
+  output and does not stop the runner or the other resets. With the option off nothing changes.
+
 ## 1.9.0 (2026-11-24)
 
 ### Added
