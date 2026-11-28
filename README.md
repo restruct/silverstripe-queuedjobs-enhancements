@@ -569,6 +569,47 @@ ran, whatever the outcome (complete, broken or parked `Waiting`; a parked job is
 the database, not through its file). Upstream only deletes it for a completed job. The files of
 jobs the runner did not run are left alone.
 
+**Resetting `Resettable` caches between jobs (opt-in, off by default).** A Silverstripe service that
+keeps an in-memory cache implements `SilverStripe\Core\Resettable`, with a static `reset()` that
+empties it. In a web request that cache lives as long as the request, and `SapphireTest` calls
+`reset()` on every implementor before each test. A runner that works several jobs in one process
+has neither, so what one job cached is still there for the next. To reset every implementor
+between two jobs, as the test state does between two tests:
+
+```yaml
+Restruct\QueuedJobsEnhancements\Worker\QueueWorker:
+  reset_resettables_between_jobs: true
+  # optional: implementors to leave alone (must keep their state, or are too costly to rebuild)
+  resettables_skip:
+    - App\Service\WarmLookupTable
+```
+
+Enable it when a job reads an in-memory cache that an earlier job in the same run may have
+filled with data that is no longer right (a lookup table, a permission cache, a cached setting),
+or when a project's own `Resettable` service is known to grow per job. Leave it off when nothing
+like that is in play: it is off in 1.x because no failure has been seen without it.
+
+What it costs and changes:
+
+- **Time per job.** Every implementor is reset after every job. `DataObject::reset()` also drops
+  the schema, table and enum caches, so the next job rebuilds them on first use. For a queue of
+  many short jobs that can be noticeable; measure before and after.
+- **State a later job relied on is gone.** Code that (perhaps unknowingly) depends on a value
+  carried over from an earlier job in the same run gets an empty cache instead. Put such a class
+  in `resettables_skip`.
+- **`reset()` was written for tests.** Some implementations assume a web request. Each `reset()`
+  runs on its own: one that throws is reported in the runner output
+  (`Resettable <class>::reset() failed between jobs: ...`) and the runner carries on with the next
+  implementor and the next job.
+- **`Versioned` is skipped by default.** The runner already puts the reading mode back after each
+  job, and `Versioned::reset()` would clear it and read the current controller's session, which a
+  Silverstripe 6 sake command does not have (it fails on every job there). To reset it anyway, take
+  it off the list with the keyed form; config arrays merge, so a list entry cannot be removed:
+  `resettables_skip: { 'SilverStripe\Versioned\Versioned': false }`.
+- **Only this runner.** Upstream's `ProcessJobQueueTask` runs its own loop and is not affected.
+  The current user restore and the `DataObject` cache flush above happen whether the option is on
+  or not.
+
 **Keep the crons.** The runner is an addition, not a replacement:
 
 - `ProcessJobQueueTask` cron entries keep doing what the runner does not: the job health check
@@ -883,7 +924,7 @@ bash vendor/restruct/silverstripe-queuedjobs-enhancements/tests/shell/qje-drain-
 CI (`.github/workflows/ci.yml`) runs the suite on Silverstripe 5 (PHP 8.1 and 8.3) and
 Silverstripe 6 (PHP 8.3), then boots each host, builds the database and runs both dev tasks.
 
-The suite covers the controller (auth/permission/response shape, `404` for a job the member may not view, the generic message of a `Broken` job for non-admins), the RunAs `canView()` extension, the Jobs admin create-job form (`ScheduledMethodCall` not offered, a crafted POST refused), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask` and `CheckDefaultJobsTask` (output HTML-escaped in the browser), `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal, the CLI-or-ADMIN refusal over HTTP, escaped browser output), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
+The suite covers the controller (auth/permission/response shape, `404` for a job the member may not view, the generic message of a `Broken` job for non-admins), the RunAs `canView()` extension, the Jobs admin create-job form (`ScheduledMethodCall` not offered, a crafted POST refused), `ScheduledMethodCall`, `DefaultJobManager` (discovery, diagnostics, emitted-YAML round-trip, and that it never creates jobs), `ImmediateJobRunner` (queue/`RunAsID` regression tests, a future `StartAfter` kept, a drain requested per new job, the CLI php binary under the CLI, and the IMMEDIATE trigger-file contract), `CleanupBrokenJobsTask` and `CheckDefaultJobsTask` (output HTML-escaped in the browser), `QueuedJobProfileTask` (a stub job profiled to completion, `maxcalls`, the job list, the dev-only refusal, the CLI-or-ADMIN refusal over HTTP, escaped browser output), `QueuedJobContextExtension` (the exact `$_SERVER` keys and format, cleared off `Running`), `BoundedJobMessages` (head and tail with one marker, counts across trims and step restores, a run through the real service, defaults and the opt-ins), the drain runner (priority order, every exit condition and the exit codes, linger, trigger-file deletion; `QueueWorkerTest`; the opt-in `Resettable` reset between jobs, its skip list and a throwing `reset()`; `QueueWorkerResettablesTest`), the drain spawn (which writes spawn, the command, the CLI php binary precedence and that php-fpm is never used, no exec, transactions, the test-database guard; `DrainSpawnerTest`), and the concurrency guard (defer/run matrix through the real `processJobQueue()`/`runJob()` path, including the claim-then-verify window and the inactive-sibling statuses).
 
 > **Note for contributors:** `AbstractQueuedJob` does **not** use the `Injectable` trait, so job subclasses cannot be created with `::create()`. Construct them with `new ClassName(...)` or `Injector::inst()->create()` - the tests follow this convention deliberately.
 
