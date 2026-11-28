@@ -5,6 +5,8 @@ git tags (1.0.0 to 1.4.0).
 
 ## [Unreleased]
 
+## 1.10.0 (2026-11-28)
+
 ### Added
 
 - `QueueWorker.reset_resettables_between_jobs`, off by default (#11): between two jobs the drain
